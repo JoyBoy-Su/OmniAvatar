@@ -206,11 +206,11 @@ class WanVideoPipeline(BasePipeline):
     @torch.no_grad()
     def log_video(
         self,
-        lat,
+        lat,            # (B, C, T, H, W)
         prompt,
-        fixed_frame=0, # lat frames
-        image_emb={},
-        audio_emb={},
+        fixed_frame=0,  # Number of latent frames to keep fixed (for overlap mechanism), 0 when there's no image
+        image_emb={},   # {"y": (B, C+1, T, H, W)}
+        audio_emb={},   # {"audio_emb": (1, seq_len, hidden_size * layers)}
         negative_prompt="",
         cfg_scale=5.0,
         audio_cfg_scale=5.0,
@@ -229,8 +229,8 @@ class WanVideoPipeline(BasePipeline):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
 
-        latents = lat.clone()
-        latents = torch.randn_like(latents)
+        latents = lat.clone()   # (B, C, T, H, W)
+        latents = torch.randn_like(latents) # noisy latents, (B, C, T, H, W)
         
         # Encode prompts
         self.load_models_to_device(["text_encoder"])
@@ -239,8 +239,7 @@ class WanVideoPipeline(BasePipeline):
             prompt_emb_nega = self.encode_prompt(negative_prompt, positive=False)
 
         # Extra input
-        extra_input = self.prepare_extra_input(latents)
-
+        extra_input = self.prepare_extra_input(latents) # {}
         if self.sp_size > 1:
             latents = self.sp_group.broadcast(latents)
             
@@ -249,12 +248,12 @@ class WanVideoPipeline(BasePipeline):
         tea_cache_nega = {"tea_cache": TeaCache(num_inference_steps, rel_l1_thresh=tea_cache_l1_thresh, model_id=tea_cache_model_id) if tea_cache_l1_thresh is not None and tea_cache_l1_thresh > 0 else None}
         
         # Unified Sequence Parallel
-        usp_kwargs = self.prepare_unified_sequence_parallel()
+        usp_kwargs = self.prepare_unified_sequence_parallel()   # unusable
         # Denoise
         self.load_models_to_device(["dit"])
         for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps, disable=self.sp_size > 1 and torch.distributed.get_rank() != 0)):
             if fixed_frame > 0: # new
-                latents[:, :, :fixed_frame] = lat[:, :, :fixed_frame]
+                latents[:, :, :fixed_frame] = lat[:, :, :fixed_frame]   # prefix clean latent
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
 
             # Inference

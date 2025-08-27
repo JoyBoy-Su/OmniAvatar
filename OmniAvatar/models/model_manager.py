@@ -345,7 +345,7 @@ class ModelManager:
         else:
             state_dict = None
         for model_detector in self.model_detector:
-            if model_detector.match(file_path, state_dict):
+            if model_detector.match(file_path, state_dict): # check file and state dict keys
                 model_names, models = model_detector.load(
                     file_path, state_dict,
                     device=device, torch_dtype=torch_dtype,

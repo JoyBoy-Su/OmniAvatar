@@ -213,38 +213,15 @@ class WanInferencePipeline(nn.Module):
         guidance_scale = guidance_scale if guidance_scale is not None else self.args.guidance_scale
         audio_scale = audio_scale if audio_scale is not None else self.args.audio_scale
 
-        # tai2v
-        if image_path is not None:
-            from PIL import Image
-            image = Image.open(image_path).convert("RGB")
-            image = self.transform(image).unsqueeze(0).to(self.device)
-            _, _, h, w = image.shape
-            select_size = match_size(getattr(self.args, f'image_sizes_{self.args.max_hw}'), h, w)
-            image = resize_pad(image, (h, w), select_size)
-            image = image * 2.0 - 1.0
-            image = image[:, :, None]
         # ta2v
-        else:
-            image = None
-            select_size = [height, width]
+        image = None
+        select_size = [height, width]   # video resolution
         # calculate video frames (pixel level), L = 57
-        L = int(args.max_tokens * 16 * 16 * 4 / select_size[0] / select_size[1])    # 16, 16, 4是vae+patchify的下采样倍数
+        # TODO: patch size = [1, 2, 2]
+        L = int(args.max_tokens * 16 * 16 * 4 / select_size[0] / select_size[1])
         L = L // 4 * 4 + 1 if L % 4 != 0 else L - 3  # video frames
         # calculate latent frames (latent level), T = 15
         T = (L + 3) // 4  # latent frames
-
-        if self.args.i2v:
-            if self.args.random_prefix_frames:
-                fixed_frame = overlap_frame
-                assert fixed_frame % 4 == 1
-            else:
-                fixed_frame = 1 # this branch, fixed frame is video level, prefix lat frame is latent level
-            prefix_lat_frame = (3 + fixed_frame) // 4   # 1
-            first_fixed_frame = 1   # 1
-        else:
-            fixed_frame = 0
-            prefix_lat_frame = 0
-            first_fixed_frame = 0
 
         # preprocess audio condition
         if audio_path is not None and args.use_audio:
@@ -253,14 +230,15 @@ class WanInferencePipeline(nn.Module):
             # wav2vec (audio features)
             input_values = np.squeeze(self.wav_feature_extractor(audio, sampling_rate=16000).input_values)  # also (73728,) ??
             input_values = torch.from_numpy(input_values).float().to(device=self.device)
+            # ori_audio_len = 115
             ori_audio_len = audio_len = math.ceil(len(input_values) / self.args.sample_rate * self.args.fps)
             input_values = input_values.unsqueeze(0)    # (1, 73728)
-            # padding audio (audio_len = 1 / k * L or audio_len = k * L) audio_len是L的整数倍或L是audio_len的整数倍
-            if audio_len < L - first_fixed_frame:   # L - first_fixed_frame is the number of generated frames (pixel level)
-                audio_len = audio_len + ((L - first_fixed_frame) - audio_len % (L - first_fixed_frame))
-            elif (audio_len - (L - first_fixed_frame)) % (L - fixed_frame) != 0:
-                audio_len = audio_len + ((L - fixed_frame) - (audio_len - (L - first_fixed_frame)) % (L - fixed_frame))
-            input_values = F.pad(input_values, (0, audio_len * int(self.args.sample_rate / self.args.fps) - input_values.shape[1]), mode='constant', value=0)   # (1, L')
+            # padding audio (audio_len = k * L, k = 1, 2, 3, ...) audio_len = 171
+            if audio_len < L:   # 
+                audio_len = audio_len + (L - audio_len % L) # audio_len = L
+            elif (audio_len - L) % L != 0:
+                audio_len = audio_len + (L - (audio_len - L) % L)   # audio_len = k * L, k > 1
+            input_values = F.pad(input_values, (0, audio_len * int(self.args.sample_rate / self.args.fps) - input_values.shape[1]), mode='constant', value=0)   # (1, kL), 最后一维度（也就是audio的长度维度）向右pad 0直到为K的整数倍
             # encode audio features
             with torch.no_grad():
                 # audio encoder:
@@ -273,51 +251,40 @@ class WanInferencePipeline(nn.Module):
                 audio_embeddings = hidden_states.last_hidden_state
                 for mid_hidden_states in hidden_states.hidden_states:
                     audio_embeddings = torch.cat((audio_embeddings, mid_hidden_states), -1) # (1, audio_len, hidden_size * layers)
-            seq_len = audio_len
-            audio_embeddings = audio_embeddings.squeeze(0)
-            audio_prefix = torch.zeros_like(audio_embeddings[:first_fixed_frame])   # ?
+            seq_len = audio_len # seq_len = 171
+            audio_embeddings = audio_embeddings.squeeze(0)  # (audio_len, hidden_size * layers)
+            audio_prefix = torch.zeros_like(audio_embeddings[:0])
         else:
             audio_embeddings = None
 
         # loop
-        times = (seq_len - L + first_fixed_frame) // (L-fixed_frame) + 1
-        if times * (L-fixed_frame) + fixed_frame < seq_len:
+        times = (seq_len - L) // L + 1  # times = 3
+        if times * L < seq_len:
             times += 1
         video = []
         image_emb = {}
         img_lat = None
-        if args.i2v:
-            self.pipe.load_models_to_device(['vae'])
-            img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)    # (b, c, t, h, w) (1, 16, 1, H//8, W//8)
-            msk = torch.zeros_like(img_lat.repeat(1, 1, T, 1, 1)[:,:1]) # (b, 1, T, h, w), (1, 1, 15, H//8, W//8)
-            image_cat = img_lat.repeat(1, 1, T, 1, 1)   # (b, c, T, h, w) (1, 16, 15, H//8, W//8)
-            msk[:, :, 1:] = 1   # after the first frame
-            image_emb["y"] = torch.cat([image_cat, msk], dim=1) # (b, c + 1, T, h, w) (1, 17, 15, H//8, W//8)
+        # times表示了时间轴上的第几个长度为L的block
         for t in range(times):
             print(f"[{t+1}/{times}]")
             audio_emb = {}
-            if t == 0:
-                overlap = first_fixed_frame # value = 1
-            else:
-                overlap = fixed_frame   # value = 1
-                image_emb["y"][:, -1:, :prefix_lat_frame] = 0 # image_emb["y"][:, -1:] 意味着mask, 第一次推理是mask只有1，往后都是mask overlap
+            overlap = 0
+            if t != 0:
+                image_emb["y"][:, -1:, :] = 0 # 第一次推理是mask只有1，往后都是mask overlap
             prefix_overlap = (3 + overlap) // 4
             if audio_embeddings is not None:
+                # gen_len = L - overlap (video-level overlap)
                 if t == 0:
                     audio_tensor = audio_embeddings[:min(L - overlap, audio_embeddings.shape[0])]
                 else:
-                    audio_start = L - first_fixed_frame + (t - 1) * (L - overlap)
+                    audio_start = L + (t - 1) * (L - overlap)   # L - overlap is the length of generated frames for each t
                     audio_tensor = audio_embeddings[audio_start: min(audio_start + L - overlap, audio_embeddings.shape[0])]
-                audio_tensor = torch.cat([audio_prefix, audio_tensor], dim=0)
-                audio_prefix = audio_tensor[-fixed_frame:]
-                audio_tensor = audio_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)
+                audio_tensor = torch.cat([audio_prefix, audio_tensor], dim=0)   # (gen_len + prefix_len, hidden_size * layers)
+                audio_prefix = audio_tensor[:]
+                audio_tensor = audio_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)   # (1, gen_len + prefix_len, hidden_size * layers)
                 audio_emb["audio_emb"] = audio_tensor
             else:
                 audio_prefix = None
-            if image is not None and img_lat is None:
-                self.pipe.load_models_to_device(['vae'])
-                img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)
-                assert img_lat.shape[2] == prefix_overlap
             img_lat = torch.cat([img_lat, torch.zeros_like(img_lat[:, :, :1].repeat(1, 1, T - prefix_overlap, 1, 1))], dim=2)
             frames, _, latents = self.pipe.log_video(
                 lat=img_lat,
@@ -334,7 +301,7 @@ class WanInferencePipeline(nn.Module):
                 return_latent=True
             )
             img_lat = None
-            image = (frames[:, -fixed_frame:].clip(0, 1) * 2 - 1).permute(0, 2, 1, 3, 4).contiguous()
+            image = (frames[:, :].clip(0, 1) * 2 - 1).permute(0, 2, 1, 3, 4).contiguous()
             if t == 0:
                 video.append(frames)
             else:

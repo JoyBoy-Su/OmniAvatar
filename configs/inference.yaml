@@ -1,11 +1,11 @@
 # 预训练模型路径
 dtype: "bf16"
-text_encoder_path: pretrained_models/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth
+text_encoder_path: /inspire/hdd/project/qproject-fundationmodel/liupengfei-24025/tangbohao/video_model/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
 image_encoder_path: None
-dit_path: pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00001-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00002-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00003-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00004-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00005-of-00006.safetensors,pretrained_models/Wan2.1-T2V-14B/diffusion_pytorch_model-00006-of-00006.safetensors
-vae_path: pretrained_models/Wan2.1-T2V-14B/Wan2.1_VAE.pth
-wav2vec_path: pretrained_models/wav2vec2-base-960h
-exp_path: pretrained_models/OmniAvatar-14B
+dit_path: /inspire/hdd/project/qproject-fundationmodel/liupengfei-24025/tangbohao/video_model/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors
+vae_path: /inspire/hdd/project/qproject-fundationmodel/liupengfei-24025/tangbohao/video_model/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
+wav2vec_path: /inspire/hdd/global_user/liupengfei-24025/ethan/models/wav2vec2-base-960h
+exp_path: /inspire/hdd/project/qproject-fundationmodel/liupengfei-24025/tangbohao/video_model/OmniAvatar-1.3B
 num_persistent_param_in_dit:  # You can set `num_persistent_param_in_dit` to a small number to reduce VRAM required. 
 
 reload_cfg: True
@@ -23,12 +23,12 @@ image_sizes_1280: [
              [720, 1280],
              [1280, 720]]
 max_hw: 720 # 720: 480p; 1280: 720p
-max_tokens: 30000  
+max_tokens: 20000  
 seq_len: 200
 overlap_frame: 13 # must be 1 + 4*n
 guidance_scale: 4.5
 audio_scale: 
-num_steps: 50
+num_steps: 4
 fps: 25
 sample_rate: 16000
 negative_prompt: "Vivid color tones, background/camera moving quickly, screen switching, subtitles and special effects, mutation, overexposed, static, blurred details, subtitles, style, work, painting, image, still, overall grayish, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fingers merging, motionless image, chaotic background, three legs, crowded background with many people, walking backward"

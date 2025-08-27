@@ -341,8 +341,8 @@ class WanModel(torch.nn.Module):
                 tea_cache = None,
                 **kwargs,
                 ):
-        t = self.time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, timestep))
+        # import pdb; pdb.set_trace()
+        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
         lat_h, lat_w = x.shape[-2], x.shape[-1]
@@ -351,10 +351,9 @@ class WanModel(torch.nn.Module):
             audio_emb = audio_emb.permute(0, 2, 1)[:, :, :, None, None]
             audio_emb = torch.cat([audio_emb[:, :, :1].repeat(1, 1, 3, 1, 1), audio_emb], 2) # 1, 768, 44, 1, 1
             audio_emb = self.audio_proj(audio_emb)
-
             audio_emb = torch.concat([audio_cond_proj(audio_emb) for audio_cond_proj in self.audio_cond_projs], 0)
 
-        x = torch.cat([x, y], dim=1)
+        x = torch.cat([x, y], dim=1)    # why concat y? y: (B, C+1, T, H, W), after concat(B, 2*C+1, T, H, W)
         x = self.patch_embedding(x)
         x, (f, h, w) = self.patchify(x)
         
