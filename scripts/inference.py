@@ -1,5 +1,7 @@
 import subprocess
 import os, sys
+import io
+import base64
 from glob import glob
 from datetime import datetime
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -26,6 +28,7 @@ import torchvision.transforms as transforms
 import torch.nn.functional as F
 from OmniAvatar.utils.audio_preprocess import add_silence_to_audio_ffmpeg
 from OmniAvatar.distributed.fsdp import shard_model
+from PIL import Image
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -205,7 +208,10 @@ class WanInferencePipeline(nn.Module):
                 num_steps=None,
                 negative_prompt=None,
                 guidance_scale=None,
-                audio_scale=None):
+                audio_scale=None,
+                streaming_callback=None,  # 新增：流式生成回调函数
+                streaming_mode=False,    # 新增：是否启用流式模式
+                session_id=None):       # 新增：会话ID
         overlap_frame = overlap_frame if overlap_frame is not None else self.args.overlap_frame # args.overlap_frame is 13
         num_steps = num_steps if num_steps is not None else self.args.num_steps # denoise steps
         # cfg (audio and text)
@@ -293,55 +299,304 @@ class WanInferencePipeline(nn.Module):
             image_cat = img_lat.repeat(1, 1, T, 1, 1)   # (b, c, T, h, w) (1, 16, 15, H//8, W//8)
             msk[:, :, 1:] = 1   # after the first frame
             image_emb["y"] = torch.cat([image_cat, msk], dim=1) # (b, c + 1, T, h, w) (1, 17, 15, H//8, W//8)
-        for t in range(times):
-            print(f"[{t+1}/{times}]")
-            audio_emb = {}
-            if t == 0:
-                overlap = first_fixed_frame # value = 1
-            else:
-                overlap = fixed_frame   # value = 1
-                image_emb["y"][:, -1:, :prefix_lat_frame] = 0 # image_emb["y"][:, -1:] 意味着mask, 第一次推理是mask只有1，往后都是mask overlap
-            prefix_overlap = (3 + overlap) // 4
-            if audio_embeddings is not None:
+        
+        # 流式生成模式
+        if streaming_mode and streaming_callback is not None:
+            print(f"Starting streaming generation with {times} chunks...")
+
+            # 流式生成变量
+            total_frames_generated = 0
+            if session_id is None:
+                session_id = f"session_{int(torch.rand(1).item() * 1000000)}"
+
+            # 创建输出目录用于保存video
+            import tempfile
+            import os
+            from datetime import datetime
+            output_dir = f'demo_out/streaming_videos_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+            os.makedirs(output_dir, exist_ok=True)
+
+            print(f"Video will be saved to: {output_dir}")
+
+            # 发送开始事件
+            streaming_callback({
+                'type': 'start',
+                'session_id': session_id,
+                'total_chunks': times,
+                'message': 'Video generation started',
+                'output_dir': output_dir
+            })
+
+            # 配置：是否在每个chunk生成后立刻推送帧（实时更流畅）
+            stream_frames_immediately = True
+
+            # 第一阶段：生成各个chunk；如配置为实时，则边生成边推送
+            print("Phase 1: Generating chunks" + (" and streaming frames immediately..." if stream_frames_immediately else " and collecting frames...") )
+            all_video_segments = []
+
+            for t in range(times):
+                print(f"[{t+1}/{times}] Generating chunk {t+1}")
+
+                # 发送chunk开始事件
+                streaming_callback({
+                    'type': 'chunk_start',
+                    'session_id': session_id,
+                    'chunk_number': t + 1,
+                    'total_chunks': times,
+                    'message': f'Generating chunk {t + 1}'
+                })
+
+                audio_emb = {}
                 if t == 0:
-                    audio_tensor = audio_embeddings[:min(L - overlap, audio_embeddings.shape[0])]
+                    overlap = first_fixed_frame # value = 1
                 else:
-                    audio_start = L - first_fixed_frame + (t - 1) * (L - overlap)
-                    audio_tensor = audio_embeddings[audio_start: min(audio_start + L - overlap, audio_embeddings.shape[0])]
-                audio_tensor = torch.cat([audio_prefix, audio_tensor], dim=0)
-                audio_prefix = audio_tensor[-fixed_frame:]
-                audio_tensor = audio_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)
-                audio_emb["audio_emb"] = audio_tensor
-            else:
-                audio_prefix = None
-            if image is not None and img_lat is None:
-                self.pipe.load_models_to_device(['vae'])
-                img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)
-                assert img_lat.shape[2] == prefix_overlap
-            img_lat = torch.cat([img_lat, torch.zeros_like(img_lat[:, :, :1].repeat(1, 1, T - prefix_overlap, 1, 1))], dim=2)
-            frames, _, latents = self.pipe.log_video(
-                lat=img_lat,
-                prompt=prompt,
-                fixed_frame=prefix_overlap,
-                image_emb=image_emb,
-                audio_emb=audio_emb,
-                negative_prompt=negative_prompt,
-                cfg_scale=guidance_scale,
-                audio_cfg_scale=audio_scale if audio_scale is not None else guidance_scale,
-                num_inference_steps=num_steps,
-                tea_cache_l1_thresh=args.tea_cache_l1_thresh,
-                tea_cache_model_id="Wan2.1-T2V-14B",
-                return_latent=True
-            )
-            img_lat = None
-            image = (frames[:, -fixed_frame:].clip(0, 1) * 2 - 1).permute(0, 2, 1, 3, 4).contiguous()
-            if t == 0:
-                video.append(frames)
-            else:
-                video.append(frames[:, overlap:])
-        video = torch.cat(video, dim=1)
-        video = video[:, :ori_audio_len + 1]
-        return video
+                    overlap = fixed_frame   # value = 1
+                    image_emb["y"][:, -1:, :prefix_lat_frame] = 0 # image_emb["y"][:, -1:] 意味着mask, 第一次推理是mask只有1，往后都是mask overlap
+                prefix_overlap = (3 + overlap) // 4
+                if audio_embeddings is not None:
+                    if t == 0:
+                        audio_tensor = audio_embeddings[:min(L - overlap, audio_embeddings.shape[0])]
+                    else:
+                        audio_start = L - first_fixed_frame + (t - 1) * (L - overlap)
+                        audio_tensor = audio_embeddings[audio_start: min(audio_start + L - overlap, audio_embeddings.shape[0])]
+                    audio_tensor = torch.cat([audio_prefix, audio_tensor], dim=0)
+                    audio_prefix = audio_tensor[-fixed_frame:]
+                    audio_tensor = audio_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)
+                    audio_emb["audio_emb"] = audio_tensor
+                else:
+                    audio_prefix = None
+                if image is not None and img_lat is None:
+                    self.pipe.load_models_to_device(['vae'])
+                    img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)
+                    assert img_lat.shape[2] == prefix_overlap
+                img_lat = torch.cat([img_lat, torch.zeros_like(img_lat[:, :, :1].repeat(1, 1, T - prefix_overlap, 1, 1))], dim=2)
+
+                # 生成当前chunk
+                frames, _, latents = self.pipe.log_video(
+                    lat=img_lat,
+                    prompt=prompt,
+                    fixed_frame=prefix_overlap,
+                    image_emb=image_emb,
+                    audio_emb=audio_emb,
+                    negative_prompt=negative_prompt,
+                    cfg_scale=guidance_scale,
+                    audio_cfg_scale=audio_scale if audio_scale is not None else guidance_scale,
+                    num_inference_steps=num_steps,
+                    tea_cache_l1_thresh=args.tea_cache_l1_thresh,
+                    tea_cache_model_id="Wan2.1-T2V-14B",
+                    return_latent=True
+                )
+
+                # 处理生成的frames
+                img_lat = None
+                image = (frames[:, -fixed_frame:].clip(0, 1) * 2 - 1).permute(0, 2, 1, 3, 4).contiguous()
+
+                # 准备当前chunk的frames
+                if t == 0:
+                    current_chunk_frames = frames
+                else:
+                    current_chunk_frames = frames[:, overlap:]
+
+                # 添加到video列表（用于后续保存或备用）
+                all_video_segments.append(current_chunk_frames)
+
+                # 推送当前chunk的帧（若启用即时推送）
+                if stream_frames_immediately:
+                    for frame_idx in range(current_chunk_frames.shape[1]):
+                        frame_data = current_chunk_frames[:, frame_idx]  # (1, 3, H, W)
+
+                        # 转换为base64格式用于传输
+                        frame_np = (frame_data.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+                        frame_pil = Image.fromarray(frame_np)
+                        buffer = io.BytesIO()
+                        frame_pil.save(buffer, format='JPEG', quality=85)
+                        frame_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+                        total_frames_generated += 1
+                        progress_overall = (total_frames_generated / ori_audio_len) * 100 if 'ori_audio_len' in locals() and ori_audio_len else None
+
+                        streaming_callback({
+                            'type': 'video_frame',
+                            'session_id': session_id,
+                            'frame_data': frame_base64,
+                            'frame_number': total_frames_generated,
+                            'total_frames': ori_audio_len if 'ori_audio_len' in locals() and ori_audio_len else None,
+                            'chunk_number': t + 1,
+                            'progress': progress_overall,
+                            'chunk_progress': ((frame_idx + 1) / current_chunk_frames.shape[1]) * 100
+                        })
+
+                else:
+                    # 如未即时推送，仅累计帧数用于进度
+                    total_frames_generated += current_chunk_frames.shape[1]
+
+                # 发送chunk完成事件（当前chunk生成与(可选)推送完成）
+                progress_overall_after_chunk = (total_frames_generated / ori_audio_len) * 100 if 'ori_audio_len' in locals() and ori_audio_len else None
+                streaming_callback({
+                    'type': 'chunk_complete',
+                    'session_id': session_id,
+                    'chunk_number': t + 1,
+                    'total_chunks': times,
+                    'frames_in_chunk': current_chunk_frames.shape[1],
+                    'total_frames_generated': total_frames_generated,
+                    'progress': progress_overall_after_chunk,
+                    'message': f'Chunk {t + 1} completed' + (" (generation + streaming)" if stream_frames_immediately else " (generation)")
+                })
+
+                print(f"Chunk {t+1} completed. Frames: {current_chunk_frames.shape[1]}")
+
+            # 第一阶段完成：保存完整的video到文件
+            print("\nPhase 1 completed! Saving video to file...")
+
+            # 拼接所有video segments
+            complete_video = torch.cat(all_video_segments, dim=1)
+            complete_video = complete_video[:, :ori_audio_len + 1]
+
+            # 保存video文件
+            try:
+                from OmniAvatar.utils.io_utils import save_video_as_grid_and_mp4
+                video_save_path = os.path.join(output_dir, f"streaming_video_{session_id}")
+                save_video_as_grid_and_mp4(
+                    complete_video,
+                    output_dir,
+                    args.fps,
+                    prompt=prompt,
+                    prefix=f'streaming_video_{session_id}'
+                )
+                print(f"✅ Video saved successfully to: {output_dir}")
+
+                # 发送video保存完成事件
+                streaming_callback({
+                    'type': 'video_saved',
+                    'session_id': session_id,
+                    'output_path': output_dir,
+                    'message': f'Video saved to {output_dir}'
+                })
+
+            except Exception as e:
+                print(f"❌ Error saving video: {e}")
+                streaming_callback({
+                    'type': 'video_save_error',
+                    'session_id': session_id,
+                    'error': str(e),
+                    'message': 'Failed to save video'
+                })
+
+            # 如已即时推送，则无需第二阶段再重复发送
+            if not stream_frames_immediately:
+                print("\nPhase 2: Starting streaming transmission...")
+
+                # 发送流式开始事件
+                streaming_callback({
+                    'type': 'streaming_start',
+                    'session_id': session_id,
+                    'total_frames': ori_audio_len,
+                    'message': 'Starting streaming transmission'
+                })
+
+                # 重新遍历所有frames并发送
+                frame_counter = 0
+                for t in range(times):
+                    print(f"[{t+1}/{times}] Streaming chunk {t+1}")
+
+                    # 获取对应的chunk frames
+                    chunk_frames = all_video_segments[t]
+
+                    # 逐帧发送
+                    for frame_idx in range(chunk_frames.shape[1]):
+                        frame_data = chunk_frames[:, frame_idx]  # (1, 3, H, W)
+
+                        # 转换为base64格式用于传输
+                        frame_np = (frame_data.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+                        frame_pil = Image.fromarray(frame_np)
+                        buffer = io.BytesIO()
+                        frame_pil.save(buffer, format='JPEG', quality=85)
+                        frame_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+
+                        # 调用流式回调函数，实时返回每一帧
+                        frame_info = {
+                            'type': 'video_frame',
+                            'session_id': session_id,
+                            'frame_data': frame_base64,
+                            'frame_number': frame_counter + frame_idx + 1,
+                            'total_frames': ori_audio_len,
+                            'chunk_number': t + 1,
+                            'progress': ((frame_counter + frame_idx + 1) / ori_audio_len) * 100,
+                            'chunk_progress': ((t + 1) / times) * 100
+                        }
+
+                        streaming_callback(frame_info)
+
+                    frame_counter += chunk_frames.shape[1]
+                    print(f"Chunk {t+1} streaming completed. Frames sent: {chunk_frames.shape[1]}")
+
+            # 流式模式完成，返回完整视频
+            final_video = torch.cat(all_video_segments, dim=1)
+            final_video = final_video[:, :ori_audio_len + 1]
+
+            # 发送完成事件
+            streaming_callback({
+                'type': 'generation_complete',
+                'session_id': session_id,
+                'total_frames': total_frames_generated,
+                'output_path': output_dir,
+                'message': 'Video generation and streaming completed'
+            })
+
+            print(f"🎉 Streaming generation completed! Video saved to: {output_dir}")
+            return final_video
+            
+        else:
+            # 原有的非流式模式
+            for t in range(times):
+                print(f"[{t+1}/{times}]")
+                audio_emb = {}
+                if t == 0:
+                    overlap = first_fixed_frame # value = 1
+                else:
+                    overlap = fixed_frame   # value = 1
+                    image_emb["y"][:, -1:, :prefix_lat_frame] = 0 # image_emb["y"][:, -1:] 意味着mask, 第一次推理是mask只有1，往后都是mask overlap
+                prefix_overlap = (3 + overlap) // 4
+                if audio_embeddings is not None:
+                    if t == 0:
+                        audio_tensor = audio_embeddings[:min(L - overlap, audio_embeddings.shape[0])]
+                    else:
+                        audio_start = L - first_fixed_frame + (t - 1) * (L - overlap)
+                        audio_tensor = audio_embeddings[audio_start: min(audio_start + L - overlap, audio_embeddings.shape[0])]
+                    audio_tensor = torch.cat([audio_prefix, audio_tensor], dim=0)
+                    audio_prefix = audio_tensor[-fixed_frame:]
+                    audio_tensor = audio_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)
+                    audio_emb["audio_emb"] = audio_emb
+                else:
+                    audio_prefix = None
+                if image is not None and img_lat is None:
+                    self.pipe.load_models_to_device(['vae'])
+                    img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)
+                    assert img_lat.shape[2] == prefix_overlap
+                img_lat = torch.cat([img_lat, torch.zeros_like(img_lat[:, :, :1].repeat(1, 1, T - prefix_overlap, 1, 1))], dim=2)
+                frames, _, latents = self.pipe.log_video(
+                    lat=img_lat,
+                    prompt=prompt,
+                    fixed_frame=prefix_overlap,
+                    image_emb=image_emb,
+                    audio_emb=audio_emb,
+                    negative_prompt=negative_prompt,
+                    cfg_scale=guidance_scale,
+                    audio_cfg_scale=audio_scale if audio_scale is not None else guidance_scale,
+                    num_inference_steps=num_steps,
+                    tea_cache_l1_thresh=args.tea_cache_l1_thresh,
+                    tea_cache_model_id="Wan2.1-T2V-14B",
+                    return_latent=True
+                )
+                img_lat = None
+                image = (frames[:, -fixed_frame:].clip(0, 1) * 2 - 1).permute(0, 2, 1, 3, 4).contiguous()
+                if t == 0:
+                    video.append(frames)
+                else:
+                    video.append(frames[:, overlap:])
+            video = torch.cat(video, dim=1)
+            video = video[:, :ori_audio_len + 1]
+            return video
 
 
 def main():
