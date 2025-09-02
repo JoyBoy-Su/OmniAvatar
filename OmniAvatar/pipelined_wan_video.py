@@ -1,4 +1,5 @@
 import types
+import os
 from .models.model_manager import ModelManager
 from .models.wan_video_dit import WanModel
 from .models.wan_video_text_encoder import WanTextEncoder
@@ -27,6 +28,7 @@ class PipelinedWanVideoPipeline(BasePipeline):
     1. 支持跳过prompt encoding
     2. 支持接收预编码的prompt embeddings
     3. 优化流水线处理流程
+    4. cfg相关的多次前向传播并行实现
     """
 
     def __init__(self, device="cuda", torch_dtype=torch.float16, tokenizer_path=None):
@@ -45,6 +47,17 @@ class PipelinedWanVideoPipeline(BasePipeline):
         self.enable_timing = True
         self.current_session_timing = {}
         self.timing_stats = defaultdict(list)
+        
+    def run_dit_inference(rank, world_size, model, data_queue, result_queue):
+        # init distributed environment
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29500"
+        torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+        # load model to device
+        model.to(f"cuda:{rank}")
+        # get input data
+        input_data = data_queue.get()
+        
 
     def start_timing(self, stage_name):
         """开始计时某个阶段"""
@@ -61,13 +74,17 @@ class PipelinedWanVideoPipeline(BasePipeline):
         return 0.0
 
     def fetch_models(self, model_manager: ModelManager):
+        # load text encode weight
         text_encoder_model_and_path = model_manager.fetch_model("wan_video_text_encoder", require_model_path=True)
         if text_encoder_model_and_path is not None:
             self.text_encoder, tokenizer_path = text_encoder_model_and_path
             self.prompter.fetch_models(self.text_encoder)
             self.prompter.fetch_tokenizer(os.path.join(os.path.dirname(tokenizer_path), "google/umt5-xxl"))
+        # load dit weight
         self.dit = model_manager.fetch_model("wan_video_dit")
+        # load vae weight
         self.vae = model_manager.fetch_model("wan_video_vae")
+        # load image encoder weight
         self.image_encoder = model_manager.fetch_model("wan_video_image_encoder")
 
     @staticmethod

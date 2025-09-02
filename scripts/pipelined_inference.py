@@ -27,7 +27,7 @@ from collections import deque
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from peft import LoraConfig, inject_adapter_in_model
+from peft import LoraConfig, inject_adapter_in_model, PeftModel
 
 from OmniAvatar.utils.args_config import parse_args
 from scripts.inference import WanInferencePipeline, set_seed
@@ -174,14 +174,14 @@ class PipelinedWanInferencePipeline(nn.Module):
         # load updated weights
         if args.train_architecture == "lora":
             print(f'Use LoRA: lora rank: {args.lora_rank}, lora alpha: {args.lora_alpha}')
-            self.add_lora_to_model(
-                    pipe.denoising_model(),
-                    lora_rank=args.lora_rank,
-                    lora_alpha=args.lora_alpha,
-                    lora_target_modules=args.lora_target_modules,
-                    init_lora_weights=args.init_lora_weights,
-                    pretrained_lora_path=pretrained_lora_path,
-                )
+            pipe.dit = self.merge_lora_to_model(
+                pipe.denoising_model(),
+                lora_rank=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_target_modules=args.lora_target_modules,
+                init_lora_weights=args.init_lora_weights,
+                pretrained_lora_path=pretrained_lora_path,
+            )
         else:
             missing_keys, unexpected_keys = pipe.denoising_model().load_state_dict(load_state_dict(resume_path), strict=True)
             print(f"load from {resume_path}, {len(missing_keys)} missing keys, {len(unexpected_keys)} unexpected keys")
@@ -211,18 +211,41 @@ class PipelinedWanInferencePipeline(nn.Module):
             init_lora_weights=init_lora_weights,
             target_modules=lora_target_modules.split(","),
         )
-        model = inject_adapter_in_model(lora_config, model)
+        model = inject_adapter_in_model(lora_config, model) # update model architecture (add lora modules), not weight
                 
         # Lora pretrained lora weights
         if pretrained_lora_path is not None:
-            state_dict = load_state_dict(pretrained_lora_path)
+            state_dict = load_state_dict(pretrained_lora_path) # load lora weights, and audio-related weights
             if state_dict_converter is not None:
                 state_dict = state_dict_converter(state_dict)
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            print(f"Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
             all_keys = [i for i, _ in model.named_parameters()]
             num_updated_keys = len(all_keys) - len(missing_keys)
             num_unexpected_keys = len(unexpected_keys)
             print(f"{num_updated_keys} parameters are loaded from {pretrained_lora_path}. {num_unexpected_keys} parameters are unexpected.")
+        # import pdb; pdb.set_trace()
+    
+    def merge_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="q,k,v,o,ffn.0,ffn.2", init_lora_weights="kaiming", pretrained_lora_path=None, state_dict_converter=None):
+        if init_lora_weights == "kaiming":
+            init_lora_weights = True
+        lora_config = LoraConfig(
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            init_lora_weights=init_lora_weights,
+            target_modules=lora_target_modules.split(",")
+        )
+        lora_model = PeftModel(model, lora_config)
+        if pretrained_lora_path is not None:
+            state_dict = load_state_dict(pretrained_lora_path)
+            if state_dict_converter is not None:
+                state_dict = state_dict_converter(state_dict)
+            # missing_keys, unexpected_keys = lora_model.load_state_dict(state_dict, strict=False)
+            missing_keys, unexpected_keys = lora_model.base_model.model.load_state_dict(state_dict, strict=False)
+            print(f"Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+        merged_model = lora_model.merge_and_unload()
+        import pdb; pdb.set_trace()
+        return merged_model
     
     # TODO: wrap input params
     def run_pipeline(
