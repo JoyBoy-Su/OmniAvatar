@@ -42,10 +42,14 @@ def read_from_file(p):
         for l in fin:
             yield l.strip()
 
-def match_size(image_size, h, w):
+def match_size(image_size, h, w):   # h = 1472, w = 1104, return select_size: [720, 720]
     ratio_ = 9999
     size_ = 9999
     select_size = None
+    # image sizes: 
+    # image_sizes_720: [[400, 720], 
+    #          [720, 720], 
+    #          [720, 400]]
     for image_s in image_size:
         ratio_tmp = abs(image_s[0] / image_s[1] - h / w)
         size_tmp = abs(max(image_s) - max(w, h))
@@ -80,6 +84,7 @@ class WanInferencePipeline(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
+        print(f"self.args: {self.args}")
         # set device and dtype
         self.device = torch.device(f"cuda:{args.rank}")
         if args.dtype=='bf16':
@@ -165,10 +170,18 @@ class WanInferencePipeline(nn.Module):
         pipe.eval()
         # auto wrapped modules, like: linear, embedding, ...
         # **set device and dtype automatically**
-        pipe.enable_vram_management(num_persistent_param_in_dit=args.num_persistent_param_in_dit) # You can set `num_persistent_param_in_dit` to a small number to reduce VRAM required. 
+        # pipe.enable_vram_management(num_persistent_param_in_dit=args.num_persistent_param_in_dit) # You can set `num_persistent_param_in_dit` to a small number to reduce VRAM required. 
         if args.use_fsdp:
             shard_fn = partial(shard_model, device_id=self.device)
             pipe.dit = shard_fn(pipe.dit)
+        # load modle to device
+        # import pdb; pdb.set_trace()
+        # pipe.load_models_to_device(pipe.model_names)
+        for model_name in pipe.model_names:
+            model = getattr(pipe, model_name)
+            if model is not None:
+                model.to(self.device)
+                print(f"Move {model_name} to {self.device}")
         return pipe
     
     def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="q,k,v,o,ffn.0,ffn.2", init_lora_weights="kaiming", pretrained_lora_path=None, state_dict_converter=None):
@@ -234,10 +247,12 @@ class WanInferencePipeline(nn.Module):
             image = None
             select_size = [height, width]
         # calculate video frames (pixel level), L = 57
+        print(f"select_size: {select_size}")
         L = int(args.max_tokens * 16 * 16 * 4 / select_size[0] / select_size[1])    # 16, 16, 4是vae+patchify的下采样倍数
         L = L // 4 * 4 + 1 if L % 4 != 0 else L - 3  # video frames
         # calculate latent frames (latent level), T = 15
         T = (L + 3) // 4  # latent frames
+        print(f"L = {L}, T = {T}")
 
         if self.args.i2v:
             if self.args.random_prefix_frames:
@@ -251,7 +266,7 @@ class WanInferencePipeline(nn.Module):
             fixed_frame = 0
             prefix_lat_frame = 0
             first_fixed_frame = 0
-
+        print(f"fixed_frame = {fixed_frame}, prefix_lat_frame = {prefix_lat_frame}, first_fixed_frame = {first_fixed_frame}")
         # preprocess audio condition
         if audio_path is not None and args.use_audio:
             # load audio wave
@@ -284,17 +299,18 @@ class WanInferencePipeline(nn.Module):
             audio_prefix = torch.zeros_like(audio_embeddings[:first_fixed_frame])   # ?
         else:
             audio_embeddings = None
-
         # loop
-        times = (seq_len - L + first_fixed_frame) // (L-fixed_frame) + 1
-        if times * (L-fixed_frame) + fixed_frame < seq_len:
+        times = (seq_len - L + first_fixed_frame) // (L - fixed_frame) + 1
+        if times * (L - fixed_frame) + fixed_frame < seq_len:
             times += 1
+        print(f"times = {times}")
         video = []
         image_emb = {}
         img_lat = None
         if args.i2v:
-            self.pipe.load_models_to_device(['vae'])
+            # self.pipe.load_models_to_device(['vae'])
             img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)    # (b, c, t, h, w) (1, 16, 1, H//8, W//8)
+            img_lat_backup = img_lat.clone()
             msk = torch.zeros_like(img_lat.repeat(1, 1, T, 1, 1)[:,:1]) # (b, 1, T, h, w), (1, 1, 15, H//8, W//8)
             image_cat = img_lat.repeat(1, 1, T, 1, 1)   # (b, c, T, h, w) (1, 16, 15, H//8, W//8)
             msk[:, :, 1:] = 1   # after the first frame
@@ -302,15 +318,14 @@ class WanInferencePipeline(nn.Module):
         
         # 流式生成模式
         if streaming_mode and streaming_callback is not None:
-            print(f"Starting streaming generation with {times} chunks...")
-
+            print(f"Starting streaming generation with {times} chunks...")            
+            # import pdb; pdb.set_trace()
             # 流式生成变量
             total_frames_generated = 0
             if session_id is None:
                 session_id = f"session_{int(torch.rand(1).item() * 1000000)}"
 
             # 创建输出目录用于保存video
-            import tempfile
             import os
             from datetime import datetime
             output_dir = f'demo_out/streaming_videos_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
@@ -350,9 +365,10 @@ class WanInferencePipeline(nn.Module):
                 if t == 0:
                     overlap = first_fixed_frame # value = 1
                 else:
-                    overlap = fixed_frame   # value = 1
+                    overlap = fixed_frame   # value = 1 + 4*n (5)
                     image_emb["y"][:, -1:, :prefix_lat_frame] = 0 # image_emb["y"][:, -1:] 意味着mask, 第一次推理是mask只有1，往后都是mask overlap
-                prefix_overlap = (3 + overlap) // 4
+                prefix_overlap = (3 + overlap) // 4 # value = 2
+                print(f"prefix_overlap: {prefix_overlap}")
                 if audio_embeddings is not None:
                     if t == 0:
                         audio_tensor = audio_embeddings[:min(L - overlap, audio_embeddings.shape[0])]
@@ -366,10 +382,12 @@ class WanInferencePipeline(nn.Module):
                 else:
                     audio_prefix = None
                 if image is not None and img_lat is None:
-                    self.pipe.load_models_to_device(['vae'])
+                    # self.pipe.load_models_to_device(['vae'])
                     img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)
+                    # print(f"img_lat: {img_lat.shape}")
                     assert img_lat.shape[2] == prefix_overlap
-                img_lat = torch.cat([img_lat, torch.zeros_like(img_lat[:, :, :1].repeat(1, 1, T - prefix_overlap, 1, 1))], dim=2)
+                # print("")
+                img_lat = torch.cat([img_lat_backup, torch.zeros_like(img_lat[:, :, :1].repeat(1, 1, T - prefix_overlap, 1, 1))], dim=2)
 
                 # 生成当前chunk
                 frames, _, latents = self.pipe.log_video(
@@ -388,7 +406,7 @@ class WanInferencePipeline(nn.Module):
                 )
 
                 # 处理生成的frames
-                img_lat = None
+                # img_lat = None
                 image = (frames[:, -fixed_frame:].clip(0, 1) * 2 - 1).permute(0, 2, 1, 3, 4).contiguous()
 
                 # 准备当前chunk的frames
@@ -570,7 +588,7 @@ class WanInferencePipeline(nn.Module):
                 else:
                     audio_prefix = None
                 if image is not None and img_lat is None:
-                    self.pipe.load_models_to_device(['vae'])
+                    # self.pipe.load_models_to_device(['vae'])
                     img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)
                     assert img_lat.shape[2] == prefix_overlap
                 img_lat = torch.cat([img_lat, torch.zeros_like(img_lat[:, :, :1].repeat(1, 1, T - prefix_overlap, 1, 1))], dim=2)

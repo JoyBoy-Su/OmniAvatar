@@ -706,7 +706,7 @@ class WanVideoVAE(nn.Module):
                 h_, w_ = h + size_h, w + size_w
                 tasks.append((h, h_, w, w_))
 
-        data_device = "cpu"
+        data_device = device
         computation_device = device
 
         out_T = (T + 3) // 4

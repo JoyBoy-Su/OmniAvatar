@@ -23,13 +23,13 @@ image_sizes_1280: [
              [720, 1280],
              [1280, 720]]
 max_hw: 720 # 720: 480p; 1280: 720p
-max_tokens: 30000  
+max_tokens: 3500  
 seq_len: 200
-overlap_frame: 13 # must be 1 + 4*n
+overlap_frame: 1 # must be 1 + 4*n
 guidance_scale: 4.5
 audio_scale: 
 num_steps: 4
-fps: 25
+fps: 16
 sample_rate: 16000
 negative_prompt: "Vivid color tones, background/camera moving quickly, screen switching, subtitles and special effects, mutation, overexposed, static, blurred details, subtitles, style, work, painting, image, still, overall grayish, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn face, deformed, disfigured, malformed limbs, fingers merging, motionless image, chaotic background, three legs, crowded background with many people, walking backward"
 silence_duration_s: 0.3

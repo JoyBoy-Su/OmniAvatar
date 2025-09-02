@@ -406,7 +406,7 @@
         let isRecording = false;
         let audioBlob = null;
         let imageFile = null;
-        let serverUrl = 'http://localhost:9090';
+        let serverUrl = 'http://localhost:9091';
         let socket = null;
         let currentSessionId = null;
         let isGenerating = false;
@@ -831,14 +831,8 @@
 
                 // 通过WebSocket发送到服务器
                 const requestData = {
-                    prompt: prompt,
                     audio_base64: audioBase64,
-                    image_base64: imageBase64,
-                    height: 720,
-                    width: 720,
-                    num_steps: 4,
-                    guidance_scale: 4.5,
-                    negative_prompt: ""
+                    image_base64: imageBase64
                 };
 
                 // 发送生成请求

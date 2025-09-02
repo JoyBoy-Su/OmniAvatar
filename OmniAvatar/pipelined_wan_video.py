@@ -20,8 +20,14 @@ import time
 import json
 from collections import defaultdict
 
-
-class WanVideoPipeline(BasePipeline):
+class PipelinedWanVideoPipeline(BasePipeline):
+    """
+    流水线化的WanVideoPipeline实现
+    主要改进：
+    1. 支持跳过prompt encoding
+    2. 支持接收预编码的prompt embeddings
+    3. 优化流水线处理流程
+    """
 
     def __init__(self, device="cuda", torch_dtype=torch.float16, tokenizer_path=None):
         super().__init__(device=device, torch_dtype=torch_dtype)
@@ -40,18 +46,6 @@ class WanVideoPipeline(BasePipeline):
         self.current_session_timing = {}
         self.timing_stats = defaultdict(list)
 
-
-    def load_models_to_device(self, loadmodel_names=[]):
-        """重写父类方法，添加时间统计"""
-        self.start_timing("model_loading")
-        
-        # 调用父类方法
-        super().load_models_to_device(loadmodel_names)
-        
-        self.end_timing("model_loading")
-        print(f"[Timing] Model loading: {self.timing_stats['model_loading'][-1]:.4f}s")
-
-
     def start_timing(self, stage_name):
         """开始计时某个阶段"""
         if self.enable_timing:
@@ -65,7 +59,7 @@ class WanVideoPipeline(BasePipeline):
             del self.current_session_timing[stage_name]
             return duration
         return 0.0
-    
+
     def fetch_models(self, model_manager: ModelManager):
         text_encoder_model_and_path = model_manager.fetch_model("wan_video_text_encoder", require_model_path=True)
         if text_encoder_model_and_path is not None:
@@ -76,12 +70,11 @@ class WanVideoPipeline(BasePipeline):
         self.vae = model_manager.fetch_model("wan_video_vae")
         self.image_encoder = model_manager.fetch_model("wan_video_image_encoder")
 
-
     @staticmethod
     def from_model_manager(model_manager: ModelManager, torch_dtype=None, device=None, use_usp=False, infer=False):
         if device is None: device = model_manager.device
         if torch_dtype is None: torch_dtype = model_manager.torch_dtype
-        pipe = WanVideoPipeline(device=device, torch_dtype=torch_dtype)
+        pipe = PipelinedWanVideoPipeline(device=device, torch_dtype=torch_dtype)
         pipe.fetch_models(model_manager)
         if use_usp:
             from xfuser.core.distributed import get_sequence_parallel_world_size, get_sp_group
@@ -92,19 +85,22 @@ class WanVideoPipeline(BasePipeline):
             pipe.use_unified_sequence_parallel = True
             pipe.sp_group = get_sp_group()
         return pipe
-    
-    
+
     def denoising_model(self):
         return self.dit
 
-
     def encode_prompt(self, prompt, positive=True):
-        self.start_timing("prompt_encoding_single")
         prompt_emb = self.prompter.encode_prompt(prompt, positive=positive, device=self.device)
-        self.end_timing("prompt_encoding_single")
         return {"context": prompt_emb}
+
+    def encode_video(self, input_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
+        latents = self.vae.encode(input_video, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        return latents
     
-    
+    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
+        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        return frames
+
     def encode_image(self, image, num_frames, height, width):
         image = self.preprocess_image(image.resize((width, height))).to(self.device)
         clip_context = self.image_encoder.encode_image([image])
@@ -122,64 +118,38 @@ class WanVideoPipeline(BasePipeline):
         y = y.to(dtype=self.torch_dtype, device=self.device)
         return {"clip_feature": clip_context, "y": y}
 
-
     def tensor2video(self, frames):
         frames = rearrange(frames, "C T H W -> T H W C")
         frames = ((frames.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
         frames = [Image.fromarray(frame) for frame in frames]
         return frames
-    
-    
-    def prepare_extra_input(self, latents=None):
-        return {}
-    
-    
-    def encode_video(self, input_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        self.start_timing("encode_video_single")
-        latents = self.vae.encode(input_video, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-        self.end_timing("encode_video_single")
-        return latents
-    
-    
-    def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        self.start_timing("decode_video_single")
-        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-        self.end_timing("decode_video_single")
-        return frames
-    
-    
+
     def prepare_unified_sequence_parallel(self):
         return {"use_unified_sequence_parallel": self.use_unified_sequence_parallel}
 
-
     @torch.no_grad()
-    def log_video(
+    def denoising_inference(
         self,
         lat,            # (B, C, T, H, W)
-        prompt,
-        fixed_frame=0,  # Number of latent frames to keep fixed (for overlap mechanism), 0 when there's no image
+        prompt_emb_posi=None,       # 新增：预编码的正向prompt embeddings
+        prompt_emb_nega=None,       # 新增：预编码的负向prompt embeddings
+        fixed_frame=0,  # Number of latent frames to keep fixed (for overlap mechanism)
         image_emb={},   # {"y": (B, C+1, T, H, W)}
         audio_emb={},   # {"audio_emb": (1, seq_len, hidden_size * layers)}
-        negative_prompt="",
         cfg_scale=5.0,
         audio_cfg_scale=5.0,
         num_inference_steps=50,
         denoising_strength=1.0,
         sigma_shift=5.0,
-        tiled=True,
-        tile_size=(30, 52),
-        tile_stride=(15, 26),
         tea_cache_l1_thresh=None,
-        tea_cache_model_id="",
-        progress_bar_cmd=tqdm,
-        return_latent=False,
+        tea_cache_model_id=""
     ):
-        # 开始总体计时
-        self.start_timing("total_generation")
+        """只进行denoising inference，不进行VAE decoding，用于流水线并行"""
+        # 开始计时
+        self.start_timing("denoising_inference_only")
         
         # 阶段1: 初始化和准备
         self.start_timing("initialization")
-        tiler_kwargs = {"tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride}
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
 
@@ -187,113 +157,73 @@ class WanVideoPipeline(BasePipeline):
         latents = torch.randn_like(latents) # noisy latents, (B, C, T, H, W)
         init_time = self.end_timing("initialization")
         print(f"[Timing] Initialization: {init_time:.4f}s")
-
-        # 阶段2: 提示词编码
-        self.start_timing("prompt_encoding")
-        # self.load_models_to_device(["text_encoder"])
-        prompt_emb_posi = self.encode_prompt(prompt, positive=True)
-        if cfg_scale != 1.0:
-            prompt_emb_nega = self.encode_prompt(negative_prompt, positive=False)
-        prompt_time = self.end_timing("prompt_encoding")
-        print(f"[Timing] Prompt encoding: {prompt_time:.4f}s")
-
-        # 阶段3: 额外输入准备
-        self.start_timing("extra_input_preparation")
-        extra_input = self.prepare_extra_input(latents) # {}
-        if self.sp_size > 1:
-            latents = self.sp_group.broadcast(latents)
-        extra_time = self.end_timing("extra_input_preparation")
-        print(f"[Timing] Extra input preparation: {extra_time:.4f}s")
-            
-        # 阶段4: TeaCache初始化
+        
+        # 阶段2: TeaCache初始化
         self.start_timing("tea_cache_init")
         tea_cache_posi = {"tea_cache": TeaCache(num_inference_steps, rel_l1_thresh=tea_cache_l1_thresh, model_id=tea_cache_model_id) if tea_cache_l1_thresh is not None and tea_cache_l1_thresh > 0 else None}
         tea_cache_nega = {"tea_cache": TeaCache(num_inference_steps, rel_l1_thresh=tea_cache_l1_thresh, model_id=tea_cache_model_id) if tea_cache_l1_thresh is not None and tea_cache_l1_thresh > 0 else None}
         tea_cache_time = self.end_timing("tea_cache_init")
         print(f"[Timing] TeaCache initialization: {tea_cache_time:.4f}s")
-        
-        # 阶段5: 统一序列并行准备
-        self.start_timing("usp_preparation")
-        usp_kwargs = self.prepare_unified_sequence_parallel()   # unusable
-        usp_time = self.end_timing("usp_preparation")
-        print(f"[Timing] USP preparation: {usp_time:.4f}s")
-        
-        # 阶段6: 降噪推理
+
+        # 阶段3: 降噪推理
         self.start_timing("denoising_inference")
-        # self.load_models_to_device(["dit"])
-        
-        # 降噪循环计时
         denoising_times = []
-        for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps, disable=self.sp_size > 1 and torch.distributed.get_rank() != 0)):
+        # 降噪循环
+        for progress_id, timestep in enumerate(self.scheduler.timesteps):
             step_start_time = time.time()
-            
-            if fixed_frame > 0: # new
+            if fixed_frame > 0:
                 latents[:, :, :fixed_frame] = lat[:, :, :fixed_frame]   # prefix clean latent
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-            # import pdb; pdb.set_trace()
 
             # Inference
-            noise_pred_posi = self.dit(latents, timestep=timestep, **prompt_emb_posi, **image_emb, **audio_emb, **tea_cache_posi, **extra_input)
+            noise_pred_posi = self.dit(latents, timestep=timestep, **prompt_emb_posi, **image_emb, **audio_emb, **tea_cache_posi)
             if cfg_scale != 1.0:
                 audio_emb_uc = {}
                 for key in audio_emb.keys():
                     audio_emb_uc[key] = torch.zeros_like(audio_emb[key])
                 if audio_cfg_scale == cfg_scale:
-                    noise_pred_nega = self.dit(latents, timestep=timestep, **prompt_emb_nega, **image_emb, **audio_emb_uc, **tea_cache_nega, **extra_input)
+                    noise_pred_nega = self.dit(latents, timestep=timestep, **prompt_emb_nega, **image_emb, **audio_emb_uc, **tea_cache_nega)
                     noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
                 else:
                     tea_cache_nega_audio = {"tea_cache": TeaCache(num_inference_steps, rel_l1_thresh=tea_cache_l1_thresh, model_id=tea_cache_model_id) if tea_cache_l1_thresh is not None and tea_cache_l1_thresh > 0 else None}
-                    audio_noise_pred_nega = self.dit(latents, timestep=timestep, **prompt_emb_posi, **image_emb, **audio_emb_uc, **tea_cache_nega_audio, **extra_input)
-                    text_noise_pred_nega = self.dit(latents, timestep=timestep, **prompt_emb_nega, **image_emb, **audio_emb_uc, **tea_cache_nega, **extra_input)
+                    audio_noise_pred_nega = self.dit(latents, timestep=timestep, **prompt_emb_posi, **image_emb, **audio_emb_uc, **tea_cache_nega_audio)
+                    text_noise_pred_nega = self.dit(latents, timestep=timestep, **prompt_emb_nega, **image_emb, **audio_emb_uc, **tea_cache_nega)
                     noise_pred = text_noise_pred_nega + cfg_scale * (audio_noise_pred_nega - text_noise_pred_nega) + audio_cfg_scale * (noise_pred_posi - audio_noise_pred_nega)
             else:
                 noise_pred = noise_pred_posi
             # Scheduler
             latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
-            
             # 记录每个step的耗时
             step_time = time.time() - step_start_time
             denoising_times.append(step_time)
         
-        # 记录降噪阶段的统计信息
-        if denoising_times:
-            self.timing_stats["denoising_step_avg"].append(np.mean(denoising_times))
-            self.timing_stats["denoising_step_min"].append(np.min(denoising_times))
-            self.timing_stats["denoising_step_max"].append(np.max(denoising_times))
-            self.timing_stats["denoising_total"].append(np.sum(denoising_times))
-        
         denoising_time = self.end_timing("denoising_inference")
         print(f"[Timing] Denoising inference: {denoising_time:.4f}s (avg step: {np.mean(denoising_times):.4f}s)")
             
-        if fixed_frame > 0: # new
+        if fixed_frame > 0:
             latents[:, :, :fixed_frame] = lat[:, :, :fixed_frame]
-            
-        # 阶段7: VAE解码
-        self.start_timing("vae_decoding")
-        # self.load_models_to_device(['vae']) 
-        frames = self.decode_video(latents, **tiler_kwargs)
-        # recons = self.decode_video(lat, **tiler_kwargs)
-        # self.load_models_to_device([])
-        vae_time = self.end_timing("vae_decoding")
-        print(f"[Timing] VAE decoding: {vae_time:.4f}s")
-        
-        # 阶段8: 后处理
+        total_time = self.end_timing("denoising_inference_only")
+        print(f"[Timing] Total denoising: {total_time:.4f}s")
+        return latents
+
+    @torch.no_grad()
+    def vae_decoding(
+        self,
+        latents,        # (B, C, T, H, W) - denoised latents
+        tiled=True,
+        tile_size=(30, 52),
+        tile_stride=(15, 26),
+    ):
+        self.start_timing("vae_decoding_standalone")
+        # VAE解码
+        frames = self.decode_video(latents, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        # 后处理
         self.start_timing("post_processing")
         frames = (frames.permute(0, 2, 1, 3, 4).float() + 1) / 2
-        # recons = (recons.permute(0, 2, 1, 3, 4).float() + 1) / 2
         post_time = self.end_timing("post_processing")
-        print(f"[Timing] Post processing: {post_time:.4f}s")
-        
-        # 结束总体计时
-        total_time = self.end_timing("total_generation")
-        print(f"[Timing] Total generation: {total_time:.4f}s")
-        
-        if return_latent:
-            # return frames, recons, latents
-            return frames, None, latents
-        # return frames, recons
-        return frames, None
-
+        vae_time = self.end_timing("vae_decoding_standalone")
+        print(f"[Timing] VAE decoding standalone: {vae_time:.4f}s (post_processing: {post_time:.4f}s)")
+        return frames
 
 class TeaCache:
     def __init__(self, num_inference_steps, rel_l1_thresh, model_id):
