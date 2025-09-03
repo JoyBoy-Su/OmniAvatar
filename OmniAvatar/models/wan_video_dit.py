@@ -254,8 +254,6 @@ class Head(nn.Module):
         x = (self.head(self.norm(x) * (1 + scale) + shift))
         return x
 
-
-
 class WanModel(torch.nn.Module):
     def __init__(
         self,
@@ -339,9 +337,17 @@ class WanModel(torch.nn.Module):
                 audio_emb: Optional[torch.Tensor] = None,
                 use_gradient_checkpointing_offload: bool = False,
                 tea_cache = None,
+                device: str = "cuda",
                 **kwargs,
                 ):
         # import pdb; pdb.set_trace()
+        x = x.to(device)
+        timestep = timestep.to(device)
+        context = context.to(device)
+        if clip_feature is not None: clip_feature = clip_feature.to(device)
+        if y is not None: y = y.to(device)
+        if audio_emb is not None: audio_emb = audio_emb.to(device)
+        # forward
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
@@ -362,11 +368,6 @@ class WanModel(torch.nn.Module):
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-        
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
-            return custom_forward
         
         if tea_cache is not None:
             tea_cache_update = tea_cache.check(self, x, t_mod)
@@ -389,45 +390,20 @@ class WanModel(torch.nn.Module):
                 
             for layer_i, block in enumerate(self.blocks):
                 # audio cond
-                if self.use_audio:
-                    au_idx = None
-                    if (layer_i <= len(self.blocks) // 2 and layer_i > 1): # < len(self.blocks) - 1:
-                        au_idx = layer_i - 2
-                        audio_emb_tmp = audio_emb[:, au_idx].repeat(1, 1, lat_h // 2, lat_w // 2, 1) # 1, 11, 45, 25, 128
-                        audio_cond_tmp = self.patchify(audio_emb_tmp.permute(0, 4, 1, 2, 3))[0]
-                        if args.sp_size > 1:
-                            if pad_size > 0:    
-                                audio_cond_tmp = torch.cat([audio_cond_tmp, torch.zeros_like(audio_cond_tmp[:, -1:]).repeat(1, pad_size, 1)], 1)
-                            audio_cond_tmp = torch.chunk(audio_cond_tmp, sp_size, dim=1)[get_sequence_parallel_rank()]
-                        x = audio_cond_tmp + x
+                au_idx = None
+                if (layer_i <= len(self.blocks) // 2 and layer_i > 1): # < len(self.blocks) - 1:
+                    au_idx = layer_i - 2
+                    audio_emb_tmp = audio_emb[:, au_idx].repeat(1, 1, lat_h // 2, lat_w // 2, 1) # 1, 11, 45, 25, 128
+                    audio_cond_tmp = self.patchify(audio_emb_tmp.permute(0, 4, 1, 2, 3))[0]
+                    x = audio_cond_tmp + x
+                x = block(x, context, t_mod, freqs)
 
-                if self.training and use_gradient_checkpointing:
-                    if use_gradient_checkpointing_offload:
-                        with torch.autograd.graph.save_on_cpu():
-                            x = torch.utils.checkpoint.checkpoint(
-                                create_custom_forward(block),
-                                x, context, t_mod, freqs,
-                                use_reentrant=False,
-                            )
-                    else:
-                        x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
-                            x, context, t_mod, freqs,
-                            use_reentrant=False,
-                        )
-                else:
-                    x = block(x, context, t_mod, freqs)
             if tea_cache is not None:
                 x_cache = get_sp_group().all_gather(x, dim=1) # TODO: the size should be devided by sp_size
                 x_cache = x_cache[:, :ori_x_len]
                 tea_cache.store(x_cache)
 
         x = self.head(x, t)
-        if args.sp_size > 1:
-            # Context Parallel
-            x = get_sp_group().all_gather(x, dim=1) # TODO: the size should be devided by sp_size
-            x = x[:, :ori_x_len]
-
         x = self.unpatchify(x, (f, h, w))
         return x
 

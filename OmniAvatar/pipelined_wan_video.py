@@ -20,6 +20,7 @@ from .models.wan_video_vae import RMS_norm, CausalConv3d, Upsample
 import time
 import json
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 class PipelinedWanVideoPipeline(BasePipeline):
     """
@@ -38,6 +39,7 @@ class PipelinedWanVideoPipeline(BasePipeline):
         self.text_encoder: WanTextEncoder = None
         self.image_encoder = None
         self.dit: WanModel = None
+        self.dit2: WanModel = None
         self.vae: WanVideoVAE = None
         self.model_names = ['text_encoder', 'dit', 'vae', 'image_encoder']
         self.height_division_factor = 16
@@ -47,17 +49,6 @@ class PipelinedWanVideoPipeline(BasePipeline):
         self.enable_timing = True
         self.current_session_timing = {}
         self.timing_stats = defaultdict(list)
-        
-    def run_dit_inference(rank, world_size, model, data_queue, result_queue):
-        # init distributed environment
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "29500"
-        torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-        # load model to device
-        model.to(f"cuda:{rank}")
-        # get input data
-        input_data = data_queue.get()
-        
 
     def start_timing(self, stage_name):
         """开始计时某个阶段"""
@@ -89,8 +80,10 @@ class PipelinedWanVideoPipeline(BasePipeline):
 
     @staticmethod
     def from_model_manager(model_manager: ModelManager, torch_dtype=None, device=None, use_usp=False, infer=False):
-        if device is None: device = model_manager.device
-        if torch_dtype is None: torch_dtype = model_manager.torch_dtype
+        if device is None: 
+            device = model_manager.device
+        if torch_dtype is None: 
+            torch_dtype = model_manager.torch_dtype
         pipe = PipelinedWanVideoPipeline(device=device, torch_dtype=torch_dtype)
         pipe.fetch_models(model_manager)
         if use_usp:
@@ -111,11 +104,11 @@ class PipelinedWanVideoPipeline(BasePipeline):
         return {"context": prompt_emb}
 
     def encode_video(self, input_video, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        latents = self.vae.encode(input_video, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        latents = self.vae.encode(input_video, device="cuda:1", tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return latents
     
     def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        frames = self.vae.decode(latents, device="cuda:1", tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         return frames
 
     def encode_image(self, image, num_frames, height, width):
@@ -143,6 +136,95 @@ class PipelinedWanVideoPipeline(BasePipeline):
 
     def prepare_unified_sequence_parallel(self):
         return {"use_unified_sequence_parallel": self.use_unified_sequence_parallel}
+
+    def _run_dit_in_stream(self, result_dict, key, *args, **kwargs):
+        try:
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                output = self.dit(*args, **kwargs)
+                result_dict[key] = output
+        except Exception as e:
+            print(f"Error in thread {key}: {e}")
+            result_dict[key] = None
+            
+    @torch.no_grad()
+    def denoising_inference_parallel(
+        self,
+        lat,            # (B, C, T, H, W)
+        prompt_emb_posi=None,       # 新增：预编码的正向prompt embeddings
+        prompt_emb_nega=None,       # 新增：预编码的负向prompt embeddings
+        fixed_frame=0,  # Number of latent frames to keep fixed (for overlap mechanism)
+        image_emb={},   # {"y": (B, C+1, T, H, W)}
+        audio_emb={},   # {"audio_emb": (1, seq_len, hidden_size * layers)}
+        cfg_scale=5.0,
+        audio_cfg_scale=5.0,
+        num_inference_steps=50,
+        denoising_strength=1.0,
+        sigma_shift=5.0,
+        tea_cache_l1_thresh=None,
+        tea_cache_model_id=""
+    ):
+        """只进行denoising inference，不进行VAE decoding，用于流水线并行"""
+        # 开始计时
+        self.start_timing("denoising_inference_only")
+        
+        # 阶段1: 初始化和准备
+        self.start_timing("initialization")
+        # Scheduler
+        self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
+
+        latents = lat.clone()   # (B, C, T, H, W)
+        latents = torch.randn_like(latents) # noisy latents, (B, C, T, H, W)
+        init_time = self.end_timing("initialization")
+        print(f"[Timing] Initialization: {init_time:.4f}s")
+        print(f"Audio scale: {audio_cfg_scale}, CFG scale: {cfg_scale}")
+        
+        # 阶段2: TeaCache初始化
+        self.start_timing("tea_cache_init")
+        tea_cache_posi = {"tea_cache": TeaCache(num_inference_steps, rel_l1_thresh=tea_cache_l1_thresh, model_id=tea_cache_model_id) if tea_cache_l1_thresh is not None and tea_cache_l1_thresh > 0 else None}
+        tea_cache_nega = {"tea_cache": TeaCache(num_inference_steps, rel_l1_thresh=tea_cache_l1_thresh, model_id=tea_cache_model_id) if tea_cache_l1_thresh is not None and tea_cache_l1_thresh > 0 else None}
+        tea_cache_time = self.end_timing("tea_cache_init")
+        print(f"[Timing] TeaCache initialization: {tea_cache_time:.4f}s")
+
+        # 阶段3: 降噪推理
+        self.start_timing("denoising_inference")
+        denoising_times = []
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for progress_id, timestep in enumerate(self.scheduler.timesteps):
+                step_start_time = time.time()
+                if fixed_frame > 0:
+                    latents[:, :, :fixed_frame] = lat[:, :, :fixed_frame]
+                # 将 timestep 移动到主设备
+                timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+                # --- 并行执行 DIT Forward ---
+                if cfg_scale != 1.0:
+                    # 准备无条件音频嵌入
+                    audio_emb_uc = {key: torch.zeros_like(audio_emb[key]) for key in audio_emb.keys()}
+                    # if audio_cfg_scale == cfg_scale:
+                    # 场景1: 2个并行 forward (posi, nega)
+                    # 提交任务到线程池
+                    future_posi = executor.submit(self.dit, latents, timestep=timestep, device=self.device, **prompt_emb_posi, **image_emb, **audio_emb, **tea_cache_posi)
+                    future_nega = executor.submit(self.dit2, latents, timestep=timestep, device="cuda:2", **prompt_emb_nega, **image_emb, **audio_emb_uc, **tea_cache_nega)
+                    # 获取结果，.result() 会阻塞直到任务完成
+                    noise_pred_posi = future_posi.result()
+                    # 将 dit2 的结果移回主设备
+                    noise_pred_nega = future_nega.result().to(self.device)
+                    noise_pred = noise_pred_nega + cfg_scale * (noise_pred_posi - noise_pred_nega)
+
+                # --- Scheduler Step (与原版相同) ---
+                latents = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], latents)
+                step_time = time.time() - step_start_time
+                denoising_times.append(step_time)
+
+        denoising_time = self.end_timing("denoising_inference")
+        print(f"[Timing] Denoising inference: {denoising_time:.4f}s (avg step: {np.mean(denoising_times):.4f}s)")
+        
+        # --- 清理阶段 (与原版相同) ---
+        if fixed_frame > 0:
+            latents[:, :, :fixed_frame] = lat[:, :, :fixed_frame]
+        total_time = self.end_timing("denoising_inference_only")
+        print(f"[Timing] Total denoising: {total_time:.4f}s")
+        return latents
 
     @torch.no_grad()
     def denoising_inference(

@@ -9,6 +9,7 @@ import base64
 import tempfile
 import traceback
 import librosa
+import copy
 from datetime import datetime
 import asyncio
 import threading
@@ -185,6 +186,10 @@ class PipelinedWanInferencePipeline(nn.Module):
         else:
             missing_keys, unexpected_keys = pipe.denoising_model().load_state_dict(load_state_dict(resume_path), strict=True)
             print(f"load from {resume_path}, {len(missing_keys)} missing keys, {len(unexpected_keys)} unexpected keys")
+        # copy dit2
+        pipe.dit2 = copy.deepcopy(pipe.dit)
+        # move device
+        # pipe.dit = torch.compile(pipe.dit, mode="max-autotune")
         pipe.requires_grad_(False)
         pipe.eval()
         if args.use_fsdp:
@@ -196,6 +201,12 @@ class PipelinedWanInferencePipeline(nn.Module):
             if model is not None:
                 model.to(self.device)
                 print(f"Move {model_name} to {self.device}")
+            if model_name == "vae":
+                model.to("cuda:1")
+                print(f"Move {model_name} to cuda:1")
+        # move dit2
+        pipe.dit2.to("cuda:2")
+        print(f"Move dit2 to cuda:2")
         # import pdb; pdb.set_trace()
         return pipe
     
@@ -244,7 +255,7 @@ class PipelinedWanInferencePipeline(nn.Module):
             missing_keys, unexpected_keys = lora_model.base_model.model.load_state_dict(state_dict, strict=False)
             print(f"Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
         merged_model = lora_model.merge_and_unload()
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         return merged_model
     
     # TODO: wrap input params
@@ -463,7 +474,7 @@ class PipelinedWanInferencePipeline(nn.Module):
         # image emb: 包含了reference image的latent，用来在channel维度和latent concatenate（即每一帧都有reference image的features）
         # image lat: image的latent representation，(b, c, t, h, w) (1, 16, 1, H//8, W//8)
         if self.args.i2v:
-            img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)
+            img_lat = self.pipe.encode_video(image.to(dtype=self.dtype, device="cuda:1")).to(self.device)
             img_lat_backup = img_lat.clone()
             msk = torch.zeros_like(img_lat.repeat(1, 1, T, 1, 1)[:,:1])
             image_cat = img_lat.repeat(1, 1, T, 1, 1)
@@ -540,7 +551,7 @@ class PipelinedWanInferencePipeline(nn.Module):
                 task = self.denoising_queue.get(timeout=0.1)
                 chunk_id = task["chunk_id"]
                 print(f"Processing denoising inference for chunk {chunk_id}")
-                latents = self.pipe.denoising_inference(
+                latents = self.pipe.denoising_inference_parallel(
                     lat=task['img_lat'],
                     prompt_emb_posi=task['prompt_emb_posi'],
                     prompt_emb_nega=task['prompt_emb_nega'],
@@ -586,8 +597,10 @@ class PipelinedWanInferencePipeline(nn.Module):
                 chunk_id = task["chunk_id"]
                 print(f"Processing vae decoding for chunk {chunk_id}")
                 print(f"VAE decoding latents: {task['latents'].shape}")
+                latents = task["latents"].to("cuda:1")
+                print(f"latents.device: {latents.device}")
                 frames = self.pipe.vae_decoding(
-                    latents=task["latents"],
+                    latents=latents,
                     tiled=False,
                     tile_size=(30, 52),
                     tile_stride=(15, 26)
