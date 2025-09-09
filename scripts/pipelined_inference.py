@@ -279,7 +279,8 @@ class PipelinedWanInferencePipeline(nn.Module):
             times,
             streaming_callback,
             session_id,
-            ori_audio_len
+            ori_audio_len,
+            ori_audio_wav
         ):
         # clear
         self.current_clock = 0
@@ -308,6 +309,8 @@ class PipelinedWanInferencePipeline(nn.Module):
         audio_prefix = audio_tensor[-fixed_frame:]
         audio_tensor = audio_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)
         audio_emb["audio_emb"] = audio_tensor
+        # audio wav
+        audio_wav = ori_audio_wav[:math.ceil(min(L - overlap, audio_embeddings.shape[0]) / self.args.fps * self.args.sample_rate)]
         # image input
         if image is not None and img_lat is None:
             img_lat = self.pipe.encode_video(image.to(dtype=self.dtype)).to(self.device)
@@ -328,7 +331,8 @@ class PipelinedWanInferencePipeline(nn.Module):
             "prefix_overlap": prefix_overlap,
             "overlap": overlap,
             "first_fixed_frame": first_fixed_frame,
-            "fixed_frame": fixed_frame
+            "fixed_frame": fixed_frame,
+            "audio_wav": audio_wav
         }
         self.denoising_queue.put(denoising_task)
         # wait
@@ -346,11 +350,16 @@ class PipelinedWanInferencePipeline(nn.Module):
             print(f"prefix overlap: {prefix_overlap}")
             # update audio embeddings
             audio_start = L - first_fixed_frame + (i - 1) * (L - overlap)
-            audio_tensor = audio_embeddings[audio_start: min(audio_start + L - overlap, audio_embeddings.shape[0])]
+            audio_end = min(audio_start + L - overlap, audio_embeddings.shape[0])
+            audio_tensor = audio_embeddings[audio_start:audio_end]
             audio_tensor = torch.cat([audio_prefix, audio_tensor], dim=0)
             audio_prefix = audio_tensor[-fixed_frame:]
             audio_tensor = audio_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)
             audio_emb["audio_emb"] = audio_tensor
+            # audio wave index
+            audio_wav_start = math.ceil(audio_start / self.args.fps * self.args.sample_rate)
+            audio_wav_end = math.ceil(audio_end / self.args.fps * self.args.sample_rate)
+            audio_wav = ori_audio_wav[audio_wav_start:audio_wav_end]
             # update img lat
             img_lat = torch.cat([img_lat_backup, torch.zeros_like(img_lat[:, :, :1].repeat(1, 1, T - prefix_overlap, 1, 1))], dim=2)
             # denosing task
@@ -367,7 +376,8 @@ class PipelinedWanInferencePipeline(nn.Module):
                 "prefix_overlap": prefix_overlap,
                 "overlap": overlap,
                 "first_fixed_frame": first_fixed_frame,
-                "fixed_frame": fixed_frame
+                "fixed_frame": fixed_frame,
+                "audio_wav": audio_wav
             }
             self.denoising_queue.put(denoising_task)
             # wait denoising clock and decoding clock - 1
@@ -575,7 +585,8 @@ class PipelinedWanInferencePipeline(nn.Module):
                     "latents": latents,
                     "overlap": task["overlap"],
                     "first_fixed_frame": task["first_fixed_frame"],
-                    "fixed_frame": task["fixed_frame"]
+                    "fixed_frame": task["fixed_frame"],
+                    "audio_wav": task["audio_wav"]
                 }
                 self.vae_queue.put(vae_task)
                 print(f"Denoising inference completed for chunk {chunk_id}")
@@ -614,7 +625,10 @@ class PipelinedWanInferencePipeline(nn.Module):
                     current_chunk_frames = frames[:, task["overlap"]:]
                 # assess result buffer with lock
                 with self.result_lock:
-                    self.result_buffer[chunk_id] = {"frames": current_chunk_frames}
+                    self.result_buffer[chunk_id] = {
+                        "frames": current_chunk_frames,
+                        "audio_wav": task["audio_wav"]
+                    }
                 print(f"VAE decoding completed for chunk {chunk_id}")
                 self.vae_queue.task_done()
             except queue.Empty:
@@ -632,6 +646,7 @@ class PipelinedWanInferencePipeline(nn.Module):
         # read chunk data
         chunk_data = self.result_buffer[chunk_id]
         current_chunk_frames = chunk_data["frames"]
+        audio_wav = chunk_data["audio_wav"]
         # send frames (loop)
         for frame_idx in range(current_chunk_frames.shape[1]):
             frame_data = current_chunk_frames[:, frame_idx]
