@@ -25,6 +25,8 @@ import time
 import numpy as np
 import torchvision.transforms as transforms
 from collections import deque
+import subprocess
+import cv2
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -384,9 +386,9 @@ class PipelinedWanInferencePipeline(nn.Module):
             self.denoising_events[self.current_clock].wait()
             self.vae_events[self.current_clock - 1].wait()
             # send chunk frames
-            self._send_chunk_frames(i - 1, streaming_callback, session_id, total_frames_generated, ori_audio_len, times)
+            total_frames_generated = self._send_chunk_frames(i - 1, streaming_callback, session_id, total_frames_generated, ori_audio_len, times)
         # send last chunk
-        self._send_chunk_frames(i - 1, streaming_callback, session_id, total_frames_generated, ori_audio_len, times)
+        total_frames_generated = self._send_chunk_frames(times - 1, streaming_callback, session_id, total_frames_generated, ori_audio_len, times)
         
     def forward(self, 
                 prompt,             # text prompt
@@ -548,7 +550,8 @@ class PipelinedWanInferencePipeline(nn.Module):
             times=times,
             streaming_callback=streaming_callback,
             session_id=session_id,
-            ori_audio_len=ori_audio_len
+            ori_audio_len=ori_audio_len,
+            ori_audio_wav=audio
         )
     
     def _denoising_worker(self):
@@ -641,13 +644,187 @@ class PipelinedWanInferencePipeline(nn.Module):
         print(f"Sending chunk {chunk_id} frames")
         # get chunk from buffer
         while chunk_id not in self.result_buffer:
-            print(f"self.result_buffer: {self.result_buffer}")
+            # print(f"self.result_buffer: {self.result_buffer}")
             time.sleep(0.1)
         # read chunk data
         chunk_data = self.result_buffer[chunk_id]
         current_chunk_frames = chunk_data["frames"]
         audio_wav = chunk_data["audio_wav"]
-        # send frames (loop)
+        
+        # 使用ffmpeg合并视频和音频
+        try:
+            video_base64 = self._merge_video_audio_with_ffmpeg(current_chunk_frames, audio_wav, chunk_id)
+            total_frames_generated += current_chunk_frames.shape[1]
+            progress_overall = (total_frames_generated / total_frames) * 100 if total_frames else None
+            
+            # 发送合并后的视频数据
+            streaming_callback({
+                "type": "video_chunk",
+                "session_id": session_id,
+                "video_data": video_base64,
+                "chunk_number": chunk_id,
+                "total_chunks": times,
+                "frames_in_chunk": current_chunk_frames.shape[1],
+                "total_frames_generated": total_frames_generated,
+                "progress": progress_overall,
+                "message": f"Chunk {chunk_id} completed with audio (pipelined)"
+            })
+            
+        except Exception as e:
+            print(f"Error merging video and audio for chunk {chunk_id}: {e}")
+            # 如果合并失败，回退到原来的逐帧发送方式
+            total_frames_generated = self._send_frames_fallback(current_chunk_frames, chunk_id, streaming_callback, session_id, total_frames_generated, total_frames, times)
+        
+        return total_frames_generated
+
+    def _merge_video_audio_with_ffmpeg(self, frames, audio_wav, chunk_id):
+        """
+        使用ffmpeg将frames和audio合并成视频
+        """ 
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # 保存视频帧
+            video_path = os.path.join(temp_dir, f"chunk_{chunk_id}_video.mp4")
+            audio_path = os.path.join(temp_dir, f"chunk_{chunk_id}_audio.wav")
+            output_path = os.path.join(temp_dir, f"chunk_{chunk_id}_output.mp4")
+            
+            # 将frames转换为视频文件
+            self._frames_to_video(frames, video_path)
+            
+            # 保存音频文件
+            if audio_wav is not None and len(audio_wav) > 0:
+                self._save_audio_wav(audio_wav, audio_path)
+                
+                # 使用ffmpeg合并视频和音频
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-i', video_path,
+                    '-i', audio_path,
+                    '-c:v', 'libx264',
+                    '-c:a', 'aac',
+                    '-shortest',  # 以较短的流为准
+                    '-movflags', '+faststart',  # 优化web播放
+                    output_path
+                ]
+            else:
+                # 如果没有音频，直接复制视频
+                cmd = [
+                    'ffmpeg', '-y',
+                    '-i', video_path,
+                    '-c:v', 'libx264',
+                    '-movflags', '+faststart',
+                    output_path
+                ]
+            
+            # 执行ffmpeg命令
+            print(f"Running ffmpeg command: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"FFmpeg stderr: {result.stderr}")
+                print(f"FFmpeg stdout: {result.stdout}")
+                raise Exception(f"FFmpeg failed with return code {result.returncode}: {result.stderr}")
+            
+            # 检查输出文件是否存在
+            if not os.path.exists(output_path):
+                raise Exception(f"Output video file was not created: {output_path}")
+            
+            # 读取合并后的视频文件并转换为base64
+            with open(output_path, 'rb') as f:
+                video_data = f.read()
+                video_base64 = base64.b64encode(video_data).decode('utf-8')
+            
+            print(f"Successfully created video chunk {chunk_id}, size: {len(video_data)} bytes")
+            return video_base64
+
+    def _frames_to_video(self, frames, output_path):
+        """
+        将frames转换为视频文件
+        """
+        # frames shape: (1, num_frames, 3, height, width)
+        num_frames = frames.shape[1]
+        height, width = frames.shape[3], frames.shape[4]
+        
+        print(f"Creating video with {num_frames} frames, resolution: {width}x{height}")
+        
+        # 创建VideoWriter
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        fps = getattr(self.args, 'fps', 25)  # 使用配置的fps，默认25
+        print(f"Using FPS: {fps}")
+        
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        if not out.isOpened():
+            raise Exception(f"Failed to open VideoWriter for {output_path}")
+        
+        for frame_idx in range(num_frames):
+            # 转换frame格式: (3, H, W) -> (H, W, 3)
+            frame_data = frames[0, frame_idx]  # (3, H, W)
+            frame_np = (frame_data.permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+            
+            # OpenCV使用BGR格式，PIL使用RGB格式，需要转换
+            frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+            out.write(frame_bgr)
+        
+        out.release()
+        
+        # 验证视频文件是否创建成功
+        if not os.path.exists(output_path):
+            raise Exception(f"Video file was not created: {output_path}")
+        
+        file_size = os.path.getsize(output_path)
+        print(f"Video file created successfully: {output_path}, size: {file_size} bytes")
+
+    def _save_audio_wav(self, audio_wav, output_path):
+        """
+        保存音频为wav文件
+        """
+        sample_rate = getattr(self.args, 'sample_rate', 16000)
+        
+        print(f"Saving audio: shape={audio_wav.shape if hasattr(audio_wav, 'shape') else len(audio_wav)}, sample_rate={sample_rate}")
+        
+        # 确保audio_wav是numpy数组
+        if isinstance(audio_wav, torch.Tensor):
+            audio_wav = audio_wav.cpu().numpy()
+        
+        # 归一化音频数据到[-1, 1]范围
+        if audio_wav.dtype != np.float32:
+            audio_wav = audio_wav.astype(np.float32)
+        
+        # 使用soundfile保存音频（librosa的新版本推荐方式）
+        try:
+            import soundfile as sf
+            sf.write(output_path, audio_wav, sample_rate)
+            print(f"Audio saved using soundfile: {output_path}")
+        except ImportError:
+            # 如果没有soundfile，尝试使用scipy
+            try:
+                from scipy.io import wavfile
+                # scipy需要16位整数格式
+                audio_int16 = (audio_wav * 32767).astype(np.int16)
+                wavfile.write(output_path, sample_rate, audio_int16)
+                print(f"Audio saved using scipy: {output_path}")
+            except ImportError:
+                # 最后的回退方案：使用librosa的旧API
+                try:
+                    librosa.output.write_wav(output_path, audio_wav, sample_rate)
+                    print(f"Audio saved using librosa (old API): {output_path}")
+                except AttributeError:
+                    # 新版本librosa
+                    import soundfile as sf
+                    sf.write(output_path, audio_wav, sample_rate)
+                    print(f"Audio saved using soundfile (fallback): {output_path}")
+        
+        # 验证音频文件是否创建成功
+        if not os.path.exists(output_path):
+            raise Exception(f"Audio file was not created: {output_path}")
+        
+        file_size = os.path.getsize(output_path)
+        print(f"Audio file created successfully: {output_path}, size: {file_size} bytes")
+
+    def _send_frames_fallback(self, current_chunk_frames, chunk_id, streaming_callback, session_id, total_frames_generated, total_frames, times):
+        """
+        回退方案：逐帧发送（原来的实现）
+        """
+        print(f"Using fallback method for chunk {chunk_id}")
         for frame_idx in range(current_chunk_frames.shape[1]):
             frame_data = current_chunk_frames[:, frame_idx]
             # convert to base64
@@ -680,3 +857,4 @@ class PipelinedWanInferencePipeline(nn.Module):
             "progress": progress_overall_after_chunk,
             "message": f"Chunk {chunk_id} completed (pipelined)"
         })
+        return total_frames_generated
