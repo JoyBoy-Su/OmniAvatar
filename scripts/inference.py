@@ -14,7 +14,6 @@ import torch.nn as nn
 from tqdm import tqdm
 from functools import partial
 from OmniAvatar.utils.args_config import parse_args
-args = parse_args()
 
 from OmniAvatar.utils.io_utils import load_state_dict 
 from peft import LoraConfig, inject_adapter_in_model
@@ -618,6 +617,7 @@ class WanInferencePipeline(nn.Module):
 
 
 def main():
+    args = parse_args()
     set_seed(args.seed)
     # laod data
     data_iter = read_from_file(args.input_file)

@@ -6,6 +6,7 @@ from ..utils.io_utils import load_state_dict, init_weights_on_device, hash_state
 
 
 def load_model_from_single_file(state_dict, model_names, model_classes, model_resource, torch_dtype, device, infer):
+    # import pdb; pdb.set_trace()
     loaded_model_names, loaded_models = [], []
     for model_name, model_class in zip(model_names, model_classes):
         print(f"    model_name: {model_name} model_class: {model_class.__name__}")
@@ -164,6 +165,7 @@ class ModelDetectorFromSplitedSingleFile(ModelDetectorFromSingleFile):
 
 
     def match(self, file_path="", state_dict={}):
+
         if isinstance(file_path, str) and os.path.isdir(file_path):
             return False
         if len(state_dict) == 0:
@@ -344,8 +346,10 @@ class ModelManager:
             state_dict = load_state_dict(file_path)
         else:
             state_dict = None
+       
+        # import pdb; pdb.set_trace()
         for model_detector in self.model_detector:
-            if model_detector.match(file_path, state_dict): # check file and state dict keys
+            if model_detector.match(file_path, state_dict):
                 model_names, models = model_detector.load(
                     file_path, state_dict,
                     device=device, torch_dtype=torch_dtype,

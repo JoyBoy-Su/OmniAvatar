@@ -2,6 +2,7 @@ from typing_extensions import Literal, TypeAlias
 from ..models.wan_video_dit import WanModel
 from ..models.wan_video_text_encoder import WanTextEncoder
 from ..models.wan_video_vae import WanVideoVAE
+from ..models.causal_wan_video_dit import CausalWanModel
 
 
 model_loader_configs = [
@@ -14,6 +15,8 @@ model_loader_configs = [
     (None, "9c8818c2cbea55eca56c7b447df170da", ["wan_video_text_encoder"], [WanTextEncoder], "civitai"),
     (None, "1378ea763357eea97acdef78e65d6d96", ["wan_video_vae"], [WanVideoVAE], "civitai"),
     (None, "ccc42284ea13e1ad04693284c7a09be6", ["wan_video_vae"], [WanVideoVAE], "civitai"),
+    ("ea185b6f94cb198c7e36c151ff4d86b1", "932ee6d0f20cc990c6959ad5f2deff77", ["causal_wan_video_dit"], [CausalWanModel], "civitai"),
+    ("d0427e639e275f96ed5fcd258b70e239", "2bf9513c7a3e908015f11a800fc9b820", ["causal_wan_video_dit"], [CausalWanModel], "civitai") #trained
 ]
 huggingface_model_loader_configs = [
     # These configs are provided for detecting model type automatically.

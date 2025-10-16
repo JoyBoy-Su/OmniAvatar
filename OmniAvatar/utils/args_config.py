@@ -68,9 +68,10 @@ def parse_args():
     args.device = f'cuda:{args.local_rank}'
     args.num_nodes = int(os.getenv("NNODES", "1"))
     debug = args.debug
+    '''
     if not os.path.exists(args.exp_path):
         args.exp_path = f'checkpoints/{args.exp_path}'
-
+    '''
     if hasattr(args, 'reload_cfg') and args.reload_cfg:
         # 重新加载配置文件
         conf_path = os.path.join(args.exp_path, "config.json")
@@ -93,6 +94,7 @@ def parse_args():
     dict_args = convert_namespace_to_dict(args)
     if args.local_rank == 0:
         print(dict_args)
+    print(f"====================== ALREADY LOAD ARGS ====================")
     return args
 
 def reload(args, conf_path):

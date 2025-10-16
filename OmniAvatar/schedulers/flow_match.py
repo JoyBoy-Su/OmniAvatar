@@ -46,6 +46,8 @@ class FlowMatchScheduler():
             sigma_ = 1 if (self.inverse_timesteps or self.reverse_sigmas) else 0
         else:
             sigma_ = self.sigmas[timestep_id + 1]
+       
+        
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
     
@@ -62,10 +64,12 @@ class FlowMatchScheduler():
     def add_noise(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
+        if timestep.ndim == 2:
+            timestep = timestep.flatten(0, 1)
+        timestep_id = torch.argmin((self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs())
+        sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1).to(noise.device)
         sample = (1 - sigma) * original_samples + sigma * noise
-        return sample
+        return sample.type_as(noise)
     
 
     def training_target(self, sample, noise, timestep):
