@@ -27,6 +27,7 @@ import torchvision.transforms as transforms
 from collections import deque
 import subprocess
 import cv2
+from typing import List, Optional, Dict, Any
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -114,11 +115,14 @@ class PipelinedCausalInferencePipeline(nn.Module):
     
     def run_pipeline(
             self,
-            noise_blocks,
-            text_prompts,
-            image_path,
-            audio_path,
-            initial_latent,
+            noise: torch.Tensor,
+            batch_size: int,
+            num_blocks: int,
+            num_input_frames: int,
+            initial_latent: torch.Tensor,
+            conditional_dict: dict,
+            img_lat: torch.Tensor,
+            output: torch.Tensor,
             streaming_callback,
             session_id,
             return_latents=False
@@ -144,20 +148,84 @@ class PipelinedCausalInferencePipeline(nn.Module):
         self.denoising_events.clear()
         self.vae_events.clear()
         
-        # prepare
-        num_blocks = len(noise_blocks)
-        completed_chunks = 0
-        total_frames_generated = 0
-        
         # run async threads
         self.denoising_thread = threading.Thread(target=self._causal_denoising_worker, daemon=True)
         self.vae_thread = threading.Thread(target=self._vae_worker, daemon=True)
         self.denoising_thread.start()
         self.vae_thread.start()
         
-        # Prepare conditioning (similar to causal_inference.py forward method)
-        # prepare image_condition
-        img_lat = None
+        # Step 2: cache context feature
+        current_start_frame = 0
+        if initial_latent is not None:
+            print("INITIAL_LATENT is not None!!")
+            raise ValueError
+        
+        # Step 3: temporal denoising loop
+        all_num_frames = [self.args.num_frame_per_block] * num_blocks
+        total_frames_generated = 0
+        for current_num_frames in all_num_frames:
+            print(f"===================== Current clock: {self.current_clock} ======================")
+            print(f"Processing frame {current_start_frame - num_input_frames} to {current_start_frame + current_num_frames - num_input_frames}.")
+            noisy_input = noise[:, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+            y_input = conditional_dict["image"][:, :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+            audio_input = conditional_dict["audio"][:,current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+            block_conditional_dict = conditional_dict.copy()
+            block_conditional_dict.update(image=y_input.clone(), audio=audio_input.clone())
+            
+            denoising_task = {
+                "chunk_id": self.current_clock,
+                "current_start_frame": current_start_frame,
+                "current_num_frames": current_num_frames,
+                "img_lat": img_lat.clone(),
+                "batch_size": batch_size,
+                "noisy_input": noisy_input.clone(),
+                "block_conditional_dict": block_conditional_dict,
+                "output": output.clone()
+            }
+            self.denoising_queue.put(denoising_task)
+            # wait denoising clock and decoding clock - 1
+            self.denoising_events.append(threading.Event())
+            self.denoising_events[self.current_clock].wait()
+            if self.current_clock >= 1:
+                self.vae_events[self.current_clock - 1].wait()
+            # send current chunk, TODO: update interface
+            total_frames_generated = self._send_chunk_frames(self.current_clock - 1, streaming_callback, session_id, total_frames_generated, num_blocks)
+            # Step 3.4: update the start and end frame indices
+            current_start_frame += current_num_frames
+            self.current_clock += 1
+        # TODO: wait decoding the last chunk?
+        self.vae_events[self.current_clock - 1].wait()
+        # send the last chunk, TODO: update interface
+        total_frames_generated = self._send_chunk_frames(self.current_clock - 1, streaming_callback, session_id, total_frames_generated, num_blocks)
+        
+            
+    @torch.no_grad()
+    def forward(
+        self,
+        noise: torch.Tensor,
+        text_prompts: str,
+        image_path: Optional[str] = None,
+        audio_path: Optional[str] = None,
+        initial_latent: Optional[torch.Tensor] = None,
+        return_latents: bool = False,
+        streaming_callback=None,  # 流式生成回调函数
+        session_id=None
+    ) -> torch.Tensor:
+        """
+        Forward pass with automatic conditioning initialization.
+        
+        Args:
+            noise: Input noise tensor [batch_size, num_output_frames, channels, height, width]
+            text_prompts: Text prompts for generation
+            image_path: Path to reference image (optional)
+            audio_path: Path to audio file (optional)
+            initial_latent: Initial latent for I2V [batch_size, num_input_frames, channels, height, width]
+            return_latents: Whether to return latents
+            
+        Returns:
+            Generated video tensor [batch_size, num_frames, channels, height, width]
+        """
+        # prepare image condition
         if image_path is not None:
             from PIL import Image
             image = Image.open(image_path).convert("RGB")
@@ -167,21 +235,17 @@ class PipelinedCausalInferencePipeline(nn.Module):
             image = resize_pad(image, (h, w), select_size)
             image = image * 2.0 - 1.0
             image = image[:, :, None]
-            self.causal_pipe.vae.to(self.device)
-            img_lat = self.causal_pipe.vae.encode(videos=image.to(dtype=self.dtype), device=self.device)
-            # Expand to match the total number of frames
-            total_frames = sum([noise.shape[1] for noise in noise_blocks])
-            img_lat = img_lat.repeat(1, 1, total_frames, 1, 1)
-            msk = torch.zeros_like(img_lat)[:, :1]
+            self.causal_pipe.vae.to("cuda:1")
+            img_lat = self.causal_pipe.vae.encode(videos=image.to(dtype=self.dtype),device="cuda:1").repeat(1,1,21,1,1)
+            msk = torch.zeros_like(img_lat)[:,:1]
             msk[:, :, 1:] = 1
             img_lat = torch.cat([img_lat, msk], dim=1)
-            print("img_lat:", img_lat.shape)
-            
+            print("img_lat:",img_lat.shape)
+        
         # prepare audio_condition
-        audio_emb = None
         if audio_path is not None:
             audio, sr = librosa.load(audio_path, sr=self.args.sample_rate)
-            
+        
             # Trim audio to 5 seconds
             max_duration = 5.0  # 5 seconds
             max_samples = int(max_duration * sr)
@@ -190,10 +254,10 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 print(f"Audio trimmed to {max_duration} seconds")
             
             input_values = np.squeeze(
-                self.causal_pipe.wav_feature_extractor(audio, sampling_rate=16000).input_values
-            )
+                    self.causal_pipe.wav_feature_extractor(audio, sampling_rate=16000).input_values
+                )
             input_values = torch.from_numpy(input_values).float().to(device=self.device)
-            ori_audio_len = audio_len = 81
+            audio_len = 81
             input_values = input_values.unsqueeze(0)
             
             with torch.no_grad():
@@ -206,181 +270,48 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 audio_emb = torch.cat([audio_emb[:, :, :1].repeat(1, 1, 3, 1, 1), audio_emb], 2) # 1, 768, 44, 1, 1
                 audio_emb = self.causal_pipe.generator.audio_proj(audio_emb.to(self.dtype))
                 audio_emb = torch.concat([audio_cond_proj(audio_emb) for audio_cond_proj in self.causal_pipe.generator.audio_cond_projs], 0)
-                print("audio_shape:", audio_emb.shape)
+                print("audio_shape:",audio_emb.shape)
         else:
             print("Detect No audio input!!")
-            audio_emb = None
+            audio_embeddings = None
         
-        # Submit first block
-        self.denoising_events.append(threading.Event())
-        
-        # Calculate frame ranges for each block
-        current_start_frame = 0
+        # inference (prepare for run_pipeline)
+        batch_size, num_frames, num_channels, height, width = noise.shape
+        # frame block calculations
+        assert num_frames % self.args.num_frame_per_block == 0
+        num_blocks = num_frames // self.args.num_frame_per_block
         num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
+        num_output_frames = num_frames + num_input_frames
+        # text conditioning
+        self.causal_pipe.text_encoder.to("cuda")
+        conditional_dict = self.causal_pipe.encode_text_prompts(text_prompts, positive=True)
+        conditional_dict["image"] = img_lat
+        conditional_dict["audio"] = audio_emb
         
-        for block_id in range(num_blocks):
-            print(f"===================== Processing block {block_id} =====================")
-            
-            noise = noise_blocks[block_id]
-            block_num_frames = noise.shape[1]
-            
-            # Prepare block-specific conditioning
-            block_img_lat = None
-            block_audio_emb = None
-            
-            if img_lat is not None:
-                block_img_lat = img_lat[:, :, current_start_frame:current_start_frame + block_num_frames]
-            
-            if audio_emb is not None:
-                # For audio, we need to slice appropriately based on frame timing
-                block_audio_emb = audio_emb[:, current_start_frame:current_start_frame + block_num_frames]
-            
-            # Prepare block initial latent
-            block_initial_latent = None
-            if initial_latent is not None and current_start_frame < num_input_frames:
-                end_frame = min(current_start_frame + block_num_frames, num_input_frames)
-                if end_frame > current_start_frame:
-                    block_initial_latent = initial_latent[:, current_start_frame:end_frame]
-            
-            # Create denoising task
-            denoising_task = {
-                "block_id": block_id,
-                "noise": noise.clone(),
-                "text_prompts": text_prompts,
-                "img_lat": block_img_lat.clone() if block_img_lat is not None else None,
-                "audio_emb": block_audio_emb.clone() if block_audio_emb is not None else None,
-                "initial_latent": block_initial_latent.clone() if block_initial_latent is not None else None,
-                "current_start_frame": current_start_frame,
-                "return_latents": return_latents
-            }
-            
-            self.denoising_queue.put(denoising_task)
-            
-            # Wait for denoising completion
-            self.denoising_events[self.current_clock].wait()
-            
-            # For blocks after the first, also wait for previous VAE completion
-            if block_id > 0:
-                self.vae_events[self.current_clock - 1].wait()
-                # Send previous chunk frames
-                total_frames_generated = self._send_chunk_frames(
-                    block_id - 1, streaming_callback, session_id, 
-                    total_frames_generated, num_blocks
-                )
-            
-            # Prepare for next block
-            if block_id < num_blocks - 1:
-                self.current_clock += 1
-                self.denoising_events.append(threading.Event())
-            
-            current_start_frame += block_num_frames
-        
-        # Send last chunk
-        total_frames_generated = self._send_chunk_frames(
-            num_blocks - 1, streaming_callback, session_id, 
-            total_frames_generated, num_blocks
+        output = torch.zeros(
+            [batch_size, num_output_frames, num_channels, height, width],
+            device=noise.device,
+            dtype=noise.dtype
         )
+        # step 1: initialize KV caches
+        self.causal_pipe.setup_caches(batch_size, noise.dtype, noise.device)
         
-        # Collect all results
-        all_results = []
-        for block_id in range(num_blocks):
-            while block_id not in self.result_buffer:
-                time.sleep(0.1)
-            all_results.append(self.result_buffer[block_id])
-        
-        return all_results
-    
-    def forward(self, 
-                prompt,             # text prompt
-                image_path=None,    # reference image
-                audio_path=None,    # reference audio
-                num_blocks=None,    # number of blocks for causal generation
-                frames_per_block=None,  # frames per block
-                height=720, 
-                width=720,
-                num_steps=None,
-                negative_prompt=None,
-                guidance_scale=None,
-                audio_scale=None,
-                streaming_callback=None,  # 流式生成回调函数
-                streaming_mode=False,    # 是否启用流式模式
-                session_id=None,         # 会话ID
-                return_latents=False):   # 是否返回latents
-        
-        # Set default values
-        num_blocks = num_blocks if num_blocks is not None else getattr(self.args, 'num_blocks', 7)
-        frames_per_block = frames_per_block if frames_per_block is not None else getattr(self.args, 'num_frame_per_block', 3)
-        num_steps = num_steps if num_steps is not None else self.args.num_steps
-        negative_prompt = negative_prompt if negative_prompt is not None else self.args.negative_prompt
-        guidance_scale = guidance_scale if guidance_scale is not None else self.args.guidance_scale
-        audio_scale = audio_scale if audio_scale is not None else self.args.audio_scale
-        
-        print(f"Pipelined causal inference with {num_blocks} blocks, {frames_per_block} frames per block")
-        
-        # Calculate total frames
-        total_frames = num_blocks * frames_per_block
-        
-        # Prepare noise blocks
-        noise_blocks = []
-        for block_id in range(num_blocks):
-            block_noise = torch.randn([1, frames_per_block, 16, height//8, width//8], 
-                                    device=self.device, dtype=self.dtype)
-            noise_blocks.append(block_noise)
-        
-        # Prepare initial latent (for I2V)
-        initial_latent = None
-        if image_path is not None:
-            # For I2V, we typically use the first frame as initial latent
-            # This is a simplified version - you might need to adjust based on your specific needs
-            initial_latent = torch.zeros([1, 1, 16, height//8, width//8], 
-                                       device=self.device, dtype=self.dtype)
-        
-        # 流式生成准备
-        output_dir = f'demo_out/causal_streaming_videos_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
-        os.makedirs(output_dir, exist_ok=True)
-        print(f"Video will be saved to: {output_dir}")
-
-        # 发送开始事件
-        if streaming_callback:
-            streaming_callback({
-                'type': 'start',
-                'session_id': session_id,
-                'total_blocks': num_blocks,
-                'message': 'Pipelined causal video generation started',
-                'output_dir': output_dir
-            })
-
-        # 第一阶段：提前进行prompt encoding（只执行一次）
-        print("Phase 1: Prompt encoding (executed once)")
-        start_time = time.time()
-        # Text conditioning is handled inside the causal pipeline
-        prompt_time = time.time() - start_time
-        print(f"Prompt encoding preparation completed in {prompt_time:.4f}s")
-        
-        # 发送prompt encoding完成事件
-        if streaming_callback:
-            streaming_callback({
-                'type': 'prompt_encoding_complete',
-                'session_id': session_id,
-                'time_taken': prompt_time,
-                'message': 'Prompt encoding preparation completed'
-            })
-
-        # 第二阶段：流水线化的block生成
-        print("Phase 2: Pipelined causal block generation")
-        results = self.run_pipeline(
-            noise_blocks=noise_blocks,
-            text_prompts=prompt,
-            image_path=image_path,
-            audio_path=audio_path,
+        # run pipeline
+        self.run_pipeline(
+            noise=noise,
+            batch_size=batch_size,
+            num_blocks=num_blocks,
+            num_input_frames=num_input_frames,
             initial_latent=initial_latent,
+            conditional_dict=conditional_dict,
+            img_lat=img_lat,
+            output=output,
             streaming_callback=streaming_callback,
             session_id=session_id,
             return_latents=return_latents
         )
-        
-        return results
     
+    @torch.no_grad()
     def _causal_denoising_worker(self):
         """
         Causal denoising worker
@@ -389,25 +320,53 @@ class PipelinedCausalInferencePipeline(nn.Module):
         while True:
             try:
                 task = self.denoising_queue.get(timeout=0.1)
-                block_id = task["block_id"]
-                print(f"Processing causal denoising inference for block {block_id}")
+                chunk_id = task["chunk_id"]
+                print(f"Processing causal denoising inference for chunk {chunk_id}")
+                current_start_frame = task["current_start_frame"]
+                current_num_frames = task["current_num_frames"]
+                img_lat = task["img_lat"]
+                batch_size = task["batch_size"]
+                noisy_input = task["noisy_input"]
+                block_conditional_dict = task["block_conditional_dict"]
+                output = task["output"]
+                # Step 3.1: Spatial denoising loop
+                for index, current_timestep in enumerate(self.causal_pipe.denoising_step_list):
+                    if current_start_frame == 0:
+                        noisy_input[:, :1] = img_lat[:, :16, :1].permute(0, 2, 1, 3, 4)
+                    timestep = torch.ones([batch_size, current_num_frames], device=noisy_input.device, dtype=torch.int64) * current_timestep
+                    # generate
+                    v, denoised_pred = self.causal_pipe.generator_forward(
+                        noisy_image_or_video=noisy_input,
+                        conditional_dict=block_conditional_dict,
+                        timestep=timestep,
+                        kv_cache=self.causal_pipe.kv_cache1,
+                        crossattn_cache=self.causal_pipe.crossattn_cache,
+                        current_start=current_start_frame * self.causal_pipe.frame_seq_length
+                    )
+                    
+                    if index < len(self.causal_pipe.denoising_step_list) - 1:
+                        next_timestep = self.causal_pipe.denoising_step_list[index + 1]
+                        noisy_input = self.causal_pipe.scheduler.add_noise(
+                            denoised_pred.flatten(0, 1),
+                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            next_timestep * torch.ones([batch_size * current_num_frames], device=noisy_input.device, dtype=torch.long)
+                        ).unflatten(0, denoised_pred.shape[:2])
                 
-                # Perform causal inference for this block
-                result = self.causal_pipe.inference(
-                    noise=task['noise'],
-                    text_prompts=task['text_prompts'],
-                    img_lat=task['img_lat'],
-                    audio_embed=task['audio_emb'],
-                    initial_latent=None,
-                    # initial_latent=task['initial_latent'],
-                    return_latents=task['return_latents']
+                # Step 3.2: record the model's output
+                if current_start_frame == 0:
+                    denoised_pred[:, :1] = img_lat[:, :16, :1].permute(0, 2, 1, 3, 4)
+                output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+                
+                # Step 3.3: return with timestep zero to update KV cache using clean context
+                context_timestep = torch.ones_like(timestep) * 0
+                self.causal_pipe.generator_forward(
+                    noisy_image_or_video=denoised_pred,
+                    conditional_dict=block_conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.causal_pipe.kv_cache1,
+                    crossattn_cache=self.causal_pipe.crossattn_cache,
+                    current_start=current_start_frame * self.causal_pipe.frame_seq_length,
                 )
-                
-                if task['return_latents']:
-                    video, latents = result
-                else:
-                    video = result
-                    latents = None
                 
                 # Trigger denoising event
                 self.denoising_events[self.current_clock].set()
@@ -417,23 +376,22 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 
                 # Add VAE decoding task (video is already decoded by causal_pipe.inference)
                 # But we still need to process it for streaming
-                vae_task = {
-                    "block_id": block_id,
-                    "video": video,
-                    "latents": latents
-                }
-                self.vae_queue.put(vae_task)
+                task.update({
+                    "output": output.clone()
+                })
+                self.vae_queue.put(task)
                 
-                print(f"Causal denoising inference completed for block {block_id}")
+                print(f"Causal denoising inference completed for block {chunk_id}")
                 self.denoising_queue.task_done()
                 
             except queue.Empty:
                 pass
             except Exception as e:
-                print(f"Error in causal denoising inference for block {block_id}: {e}")
+                print(f"Error in causal denoising inference for block {chunk_id}: {e}")
                 traceback.print_exc()
                 self.denoising_queue.task_done()
     
+    @torch.no_grad()
     def _vae_worker(self):
         """
         VAE processing worker (mainly for format conversion and streaming)
@@ -441,41 +399,40 @@ class PipelinedCausalInferencePipeline(nn.Module):
         while True:
             try:
                 task = self.vae_queue.get(timeout=0.1)
-                block_id = task["block_id"]
-                print(f"Processing video formatting for block {block_id}")
+                chunk_id = task["chunk_id"]
+                print(f"Processing video formatting for block {chunk_id}")
                 
-                video = task["video"]
-                latents = task["latents"]
-                
-                # Trigger VAE event
-                self.vae_events[self.current_clock - 1].set()
-                
+                output: torch.Tensor = task["output"]
+                # decoding
+                output = output.permute(0, 2, 1, 3, 4)
+                output.to("cuda:1")
+                video = self.causal_pipe.vae.decode(output, device="cuda:1")
                 # Store result in buffer with lock
+                task.update({"video": video})
                 with self.result_lock:
-                    self.result_buffer[block_id] = {
-                        "video": video,
-                        "latents": latents
-                    }
-                
-                print(f"Video formatting completed for block {block_id}")
+                    self.result_buffer[chunk_id] = task
+                print(f"Video formatting completed for block {chunk_id}")
+                # trigger vae event
+                self.vae_events[self.current_clock - 1].set()
                 self.vae_queue.task_done()
-                
             except queue.Empty:
                 pass
             except Exception as e:
-                print(f"Error in video formatting for block {block_id}: {e}")
+                print(f"Error in video formatting for block {chunk_id}: {e}")
                 traceback.print_exc()
                 self.vae_queue.task_done()
 
-    def _send_chunk_frames(self, block_id, streaming_callback, session_id, total_frames_generated, total_blocks):
+    def _send_chunk_frames(self, chunk_id, streaming_callback, session_id, total_frames_generated, total_blocks):
+        if chunk_id < 0:
+            return 0
         """Send frames for a completed block"""
-        print(f"Sending block {block_id} frames")
+        print(f"Sending block {chunk_id} frames")
         
         # Wait for result to be available
-        while block_id not in self.result_buffer:
+        while chunk_id not in self.result_buffer:
             time.sleep(0.1)
         
-        block_data = self.result_buffer[block_id]
+        block_data = self.result_buffer[chunk_id]
         video = block_data["video"]
         
         if streaming_callback is None:
@@ -492,18 +449,18 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 "type": "video_chunk",
                 "session_id": session_id,
                 "video_data": video_base64,
-                "block_number": block_id,
+                "block_number": chunk_id,
                 "total_blocks": total_blocks,
                 "progress": progress_overall,
                 "frames_in_block": video.shape[1],
-                "message": f"Block {block_id} completed (causal pipelined)"
+                "message": f"Block {chunk_id} completed (causal pipelined)"
             })
             
         except Exception as e:
-            print(f"Error creating video chunk for block {block_id}: {e}")
+            print(f"Error creating video chunk for block {chunk_id}: {e}")
             # Fallback to frame-by-frame sending
             total_frames_generated = self._send_frames_fallback(
-                video, block_id, streaming_callback, 
+                video, chunk_id, streaming_callback, 
                 session_id, total_frames_generated, total_blocks
             )
         
@@ -529,9 +486,9 @@ class PipelinedCausalInferencePipeline(nn.Module):
             video_base64 = base64.b64encode(video_bytes).decode('utf-8')
             return video_base64
 
-    def _send_frames_fallback(self, video, block_id, streaming_callback, session_id, total_frames_generated, total_blocks):
+    def _send_frames_fallback(self, video, chunk_id, streaming_callback, session_id, total_frames_generated, total_blocks):
         """Fallback method: send frames one by one"""
-        print(f"Using fallback method for block {block_id}")
+        print(f"Using fallback method for block {chunk_id}")
         
         for frame_idx in range(video.shape[1]):
             frame_data = video[:, frame_idx]
@@ -550,7 +507,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 "session_id": session_id,
                 "frame_data": frame_base64,
                 "frame_number": total_frames_generated,
-                "block_number": block_id,
+                "block_number": chunk_id,
                 "progress": progress_overall,
                 "block_progress": ((frame_idx + 1) / video.shape[1]) * 100
             })
@@ -559,72 +516,72 @@ class PipelinedCausalInferencePipeline(nn.Module):
         streaming_callback({
             "type": "block_complete",
             "session_id": session_id,
-            "block_number": block_id,
+            "block_number": chunk_id,
             "total_blocks": total_blocks,
             "frames_in_block": video.shape[1],
             "total_frames_generated": total_frames_generated,
             "progress": (total_frames_generated / (total_blocks * self.args.num_frame_per_block)) * 100,
-            "message": f"Block {block_id} completed (causal pipelined)"
+            "message": f"Block {chunk_id} completed (causal pipelined)"
         })
         
         return total_frames_generated
 
 
-def main():
-    """Main function to test the pipelined causal inference pipeline."""
-    torch.set_grad_enabled(False)
-    args = parse_args()
-    # Set device based on rank
-    device = torch.device(f"cuda:{getattr(args, 'rank', 0)}")
+# def main():
+#     """Main function to test the pipelined causal inference pipeline."""
+#     torch.set_grad_enabled(False)
+#     args = parse_args()
+#     # Set device based on rank
+#     device = torch.device(f"cuda:{getattr(args, 'rank', 0)}")
     
-    # Create pipelined causal inference pipeline
-    pipeline = PipelinedCausalInferencePipeline(args)
-    print("Pipelined causal inference pipeline initialized successfully!")
+#     # Create pipelined causal inference pipeline
+#     pipeline = PipelinedCausalInferencePipeline(args)
+#     print("Pipelined causal inference pipeline initialized successfully!")
     
-    # Prepare test parameters
-    text_prompts = getattr(args, 'prompt', "A realistic video of a man speaking directly to the camera on a sofa, with dynamic and rhythmic hand gestures that complement his speech.")
+#     # Prepare test parameters
+#     text_prompts = getattr(args, 'prompt', "A realistic video of a man speaking directly to the camera on a sofa, with dynamic and rhythmic hand gestures that complement his speech.")
     
-    print(f"Text prompts: {text_prompts}")
+#     print(f"Text prompts: {text_prompts}")
     
-    # Test streaming callback
-    def test_streaming_callback(data):
-        print(f"Streaming callback: {data['type']} - {data.get('message', '')}")
+#     # Test streaming callback
+#     def test_streaming_callback(data):
+#         print(f"Streaming callback: {data['type']} - {data.get('message', '')}")
     
-    # Perform pipelined causal inference
-    print("Starting pipelined causal inference...")
+#     # Perform pipelined causal inference
+#     print("Starting pipelined causal inference...")
     
-    results = pipeline(
-        prompt=text_prompts,
-        image_path="/data2/jdsu/projects/OmniAvatar/examples/images/0000.jpeg",
-        audio_path="/data2/jdsu/projects/OmniAvatar/examples/audios/0000.MP3",
-        num_blocks=7,
-        frames_per_block=3,
-        streaming_callback=test_streaming_callback,
-        session_id="test_session",
-        return_latents=False
-    )
+#     results = pipeline(
+#         prompt=text_prompts,
+#         image_path="/data2/jdsu/projects/OmniAvatar/examples/images/0000.jpeg",
+#         audio_path="/data2/jdsu/projects/OmniAvatar/examples/audios/0000.MP3",
+#         num_blocks=7,
+#         frames_per_block=3,
+#         streaming_callback=test_streaming_callback,
+#         session_id="test_session",
+#         return_latents=False
+#     )
     
-    print(f"Generated {len(results)} blocks")
+#     print(f"Generated {len(results)} blocks")
     
-    # Save results
-    output_path = "generated_causal_pipelined_video.mp4"
-    if results:
-        # Concatenate all video blocks
-        all_videos = []
-        for result in results:
-            all_videos.append(result["video"])
+#     # Save results
+#     output_path = "generated_causal_pipelined_video.mp4"
+#     if results:
+#         # Concatenate all video blocks
+#         all_videos = []
+#         for result in results:
+#             all_videos.append(result["video"])
         
-        # Concatenate along time dimension
-        final_video = torch.cat(all_videos, dim=1)
+#         # Concatenate along time dimension
+#         final_video = torch.cat(all_videos, dim=1)
         
-        # Save video
-        import imageio
-        video_np = (final_video.squeeze(0).permute(1, 2, 3, 0).cpu().float().numpy() * 255).astype(np.uint8)
-        imageio.mimsave(output_path, video_np, fps=getattr(args, 'fps', 16))
-        print(f"Video saved to: {output_path}")
+#         # Save video
+#         import imageio
+#         video_np = (final_video.squeeze(0).permute(1, 2, 3, 0).cpu().float().numpy() * 255).astype(np.uint8)
+#         imageio.mimsave(output_path, video_np, fps=getattr(args, 'fps', 16))
+#         print(f"Video saved to: {output_path}")
     
-    print("Pipelined causal inference completed successfully!")
+#     print("Pipelined causal inference completed successfully!")
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()

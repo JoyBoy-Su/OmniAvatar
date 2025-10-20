@@ -37,9 +37,9 @@ model_pipeline = None
 causal_model_pipeline = None
 args = None
 active_sessions = {}  # session_id -> thread info
-use_causal_mode = False  # Flag to switch between normal and causal mode
+use_causal_mode = True  # Flag to switch between normal and causal mode
 
-def initialize_model(causal_mode=False):
+def initialize_model(causal_mode=True):
     """Initialize the pipelined model pipeline"""
     global model_pipeline, causal_model_pipeline, args, use_causal_mode
     
@@ -73,30 +73,17 @@ def initialize_model(causal_mode=False):
 
     use_causal_mode = causal_mode
 
-    if causal_mode:
-        # Set CUDA device for causal mode (needs multiple GPUs)
-        os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12356'
-        os.environ['RANK'] = '0'
-        os.environ['WORLD_SIZE'] = '1'
+    # Set CUDA device for causal mode (needs multiple GPUs)
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12356'
+    os.environ['RANK'] = '0'
+    os.environ['WORLD_SIZE'] = '1'
 
-        set_seed(args.seed)
-        print("Initializing pipelined causal model pipeline...")
-        causal_model_pipeline = PipelinedCausalInferencePipeline(args)
-        print("Pipelined causal model pipeline initialized successfully!")
-    else:
-        # Set CUDA device for normal mode
-        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '12355'
-        os.environ['RANK'] = '0'
-        os.environ['WORLD_SIZE'] = '1'
-
-        set_seed(args.seed)
-        print("Initializing pipelined model pipeline...")
-        model_pipeline = PipelinedWanInferencePipeline(args)
-        print("Pipelined model pipeline initialized successfully!")
+    set_seed(args.seed)
+    print("Initializing pipelined causal model pipeline...")
+    causal_model_pipeline = PipelinedCausalInferencePipeline(args)
+    print("Pipelined causal model pipeline initialized successfully!")
 
 def streaming_callback(data):
     """Callback function for streaming data from pipelined inference pipeline"""
@@ -115,20 +102,12 @@ def streaming_callback(data):
         print(f"[PIPELINED_BACKEND] Error in streaming callback: {e}")
         traceback.print_exc()
 
-def generate_video_streaming(session_id, prompt, audio_path=None, image_path=None,
-                           height=720, width=720, num_steps=4, guidance_scale=4.5,
-                           audio_scale=None, negative_prompt="", num_blocks=None, 
-                           frames_per_block=None):
+def generate_video_streaming(session_id, prompt, audio_path=None, image_path=None):
     """Generate video in pipelined streaming mode"""
     global model_pipeline, causal_model_pipeline, args, use_causal_mode
-    print(f"Input Args: num_steps: {num_steps}, guidance_scale: {guidance_scale}, audio_scale: {audio_scale}")
-    if use_causal_mode:
-        print(f"Causal Args: num_blocks: {num_blocks}, frames_per_block: {frames_per_block}")
-
+    # print(f"Input Args: num_steps: {num_steps}, guidance_scale: {guidance_scale}, audio_scale: {audio_scale}")
+    # print(f"Causal Args: num_blocks: {num_blocks}, frames_per_block: {frames_per_block}")
     try:
-        mode_str = "causal " if use_causal_mode else ""
-        print(f"Starting pipelined {mode_str}streaming generation for session {session_id}")
-
         # Update session status
         active_sessions[session_id] = {
             'status': 'generating',
@@ -137,56 +116,30 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
         }
 
         with torch.no_grad():
-            if use_causal_mode and causal_model_pipeline is not None:
-                # Use causal pipeline
-                if num_blocks is None:
-                    num_blocks = getattr(args, 'num_blocks', 7)
-                if frames_per_block is None:
-                    frames_per_block = getattr(args, 'num_frame_per_block', 3)
-                
-                results = causal_model_pipeline(
-                    prompt=prompt,
-                    image_path=image_path,
-                    audio_path=audio_path,
-                    num_blocks=num_blocks,
-                    frames_per_block=frames_per_block,
-                    height=height,
-                    width=width,
-                    num_steps=num_steps,
-                    guidance_scale=guidance_scale,
-                    audio_scale=audio_scale,
-                    negative_prompt=negative_prompt,
-                    streaming_mode=True,
-                    streaming_callback=streaming_callback,
-                    session_id=session_id,
-                    return_latents=False
-                )
-                
-                # Process causal results
-                video = None
-                if results:
-                    all_videos = []
-                    for result in results:
-                        if "video" in result:
-                            all_videos.append(result["video"])
-                    if all_videos:
-                        video = torch.cat(all_videos, dim=1)
-            else:
-                # Use normal pipeline
-                video = model_pipeline(
-                    prompt=prompt,
-                    image_path=image_path,
-                    audio_path=audio_path,
-                    height=height,
-                    width=width,
-                    num_steps=num_steps,
-                    guidance_scale=guidance_scale,
-                    audio_scale=audio_scale,
-                    negative_prompt=negative_prompt,
-                    streaming_mode=True,  # 启用流式模式
-                    streaming_callback=streaming_callback,  # 传入回调函数
-                    session_id=session_id
-                )
+            # Use causal pipeline
+            # if num_blocks is None:
+            #     num_blocks = getattr(args, 'num_blocks', 7)
+            # if frames_per_block is None:
+            #     frames_per_block = getattr(args, 'num_frame_per_block', 3)
+            noise = torch.randn([1, 21, 16, 50, 90], device="cuda", dtype=torch.bfloat16)
+            results = causal_model_pipeline(
+                noise=noise,
+                text_prompts=prompt,
+                image_path=image_path,
+                audio_path=audio_path,
+                initial_latent=None,
+                return_latents=False
+            )
+            
+            # Process causal results
+            video = None
+            if results:
+                all_videos = []
+                for result in results:
+                    if "video" in result:
+                        all_videos.append(result["video"])
+                if all_videos:
+                    video = torch.cat(all_videos, dim=1)
 
         # Save final video
         if video is not None:
@@ -208,17 +161,17 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
         completion_data = {
             'type': 'generation_complete',
             'session_id': session_id,
-            'message': f'{"Causal " if use_causal_mode else ""}Pipelined video generation completed'
+            'message': "Causal Pipelined video generation completed"
         }
-        if use_causal_mode:
-            completion_data.update({
-                'total_blocks': num_blocks,
-                'frames_per_block': frames_per_block,
-                'total_frames': num_blocks * frames_per_block
-            })
+        # if use_causal_mode:
+        #     completion_data.update({
+        #         'total_blocks': num_blocks,
+        #         # 'frames_per_block': frames_per_block,
+        #         'total_frames': num_blocks * frames_per_block
+        #     })
         socketio.emit('generation_complete', completion_data, room=session_id)
 
-        print(f"Pipelined {mode_str}streaming generation completed for session {session_id}")
+        print(f"Pipelined causal streaming generation completed for session {session_id}")
 
     except Exception as e:
         error_data = {
@@ -228,7 +181,7 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
             'message': f'{"Causal " if use_causal_mode else ""}Pipelined video generation failed'
         }
         socketio.emit('generation_error', error_data, room=session_id)
-        print(f"Error in pipelined {mode_str}streaming generation for session {session_id}: {e}")
+        print("Error in pipelined causal streaming generation for session {session_id}: {e}")
         traceback.print_exc()
 
     finally:
@@ -354,9 +307,7 @@ def handle_generate_streaming_base64(data):
             # Start generation in background thread
             generation_thread = threading.Thread(
                 target=generate_video_streaming,
-                args=(session_id, prompt, audio_path, image_path, height, width,
-                      num_steps, guidance_scale, audio_scale, negative_prompt,
-                      num_blocks, frames_per_block)
+                args=(session_id, prompt, audio_path, image_path)
             )
             generation_thread.daemon = True
             generation_thread.start()
@@ -452,28 +403,7 @@ def model_info():
     
     return info
 
-@app.route('/switch_mode/<mode>', methods=['POST'])
-def switch_mode_http(mode):
-    """HTTP endpoint to switch between normal and causal mode"""
-    global use_causal_mode, model_pipeline, causal_model_pipeline
-    
-    if mode == 'causal':
-        if causal_model_pipeline is None:
-            return {'error': 'Causal model not initialized. Please restart server with causal mode.'}, 400
-        use_causal_mode = True
-        return {'mode': 'causal', 'message': 'Switched to causal inference mode'}
-    elif mode == 'normal':
-        if model_pipeline is None:
-            return {'error': 'Normal model not initialized. Please restart server with normal mode.'}, 400
-        use_causal_mode = False
-        return {'mode': 'normal', 'message': 'Switched to normal inference mode'}
-    else:
-        return {'error': 'Invalid mode. Use "normal" or "causal".'}, 400
-
 def main():
-    # Set sys.argv to only include model-related args for parse_args()
-    original_argv = sys.argv.copy()
-    
     # Initialize model in main process
     mp.set_start_method('spawn', force=True)
 
