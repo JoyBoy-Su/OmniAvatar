@@ -454,7 +454,14 @@
                 });
 
                 socket.on('video_chunk', function(data) {
-                    console.log('WebSocket received video_chunk event:', data);
+                    console.log('WebSocket received video_chunk event:', {
+                        session_id: data.session_id,
+                        chunk_number: data.chunk_number,
+                        total_chunks: data.total_chunks,
+                        progress: data.progress,
+                        video_data_present: !!data.video_data,
+                        video_data_length: data.video_data ? data.video_data.length : 0
+                    });
                     handleVideoChunk(data);
                 });
 
@@ -520,11 +527,15 @@
             }
         }
 
-        // 处理视频帧（原有的逐帧模式）
+        // 处理视频帧（逐帧模式 - 主要模式）
         function handleVideoFrame(data) {
-            console.log('handleVideoFrame called with data:', data);
-            console.log('currentSessionId:', currentSessionId);
-            console.log('data.session_id:', data.session_id);
+            console.log('handleVideoFrame called with data:', {
+                session_id: data.session_id,
+                frame_number: data.frame_number,
+                total_frames: data.total_frames,
+                chunk_number: data.chunk_number,
+                progress: data.progress
+            });
 
             if (data.session_id === currentSessionId) {
                 console.log('Session ID matches! Processing frame:', data.frame_number, '/', data.total_frames);
@@ -556,6 +567,12 @@
             if (data.session_id === currentSessionId) {
                 console.log('Session ID matches! Processing video chunk:', data.chunk_number, '/', data.total_chunks);
 
+                // 验证数据完整性
+                if (!data.video_data) {
+                    console.error('Video chunk missing video_data:', data);
+                    return;
+                }
+
                 isVideoMode = true;
                 videoChunks.push(data);
                 
@@ -563,12 +580,15 @@
                     isPlaying = true; // 设置播放状态
                     console.log('Starting video chunk playback...');
                     startVideoChunkPlayback();
-                } else {
-                    // 如果已经开始播放，则调用处理函数以防缓冲区空闲
+                } else if (isMSEInitialized) {
+                    // 如果MSE已初始化，直接处理新块
                     processNextChunk();
+                } else {
+                    console.log('MSE not yet initialized, chunk queued');
                 }
 
-                updateVideoChunkInfo(data); // 这是一个你尚未定义的函数，这里保留逻辑
+                // 更新UI信息
+                updateVideoChunkInfo(data);
             } else {
                 console.log('Session ID does not match! Ignoring video chunk.');
             }
@@ -589,7 +609,10 @@
         // 处理chunk完成事件
         function handleChunkComplete(data) {
             if (data.session_id === currentSessionId) {
-                console.log(`第 ${data.chunk_number} 个chunk完成，包含 ${data.frames_in_chunk} 帧`);
+                console.log(`第 ${data.chunk_number + 1} 个chunk完成，包含 ${data.frames_in_chunk} 帧`);
+                
+                // 显示chunk完成消息
+                updateStatus(`第 ${data.chunk_number + 1}/${data.total_chunks} 个chunk完成`, true);
                 
                 // 更新进度信息
                 updateProgress({
@@ -621,22 +644,80 @@
 
             mediaSource.addEventListener('sourceopen', () => {
                 console.log('MediaSource is open and ready.');
-                // 关键点: 这里的MIME类型必须和你的后端视频流格式完全一致
-                // 常见的有 'video/webm; codecs="vp8, opus"' 或 'video/mp4; codecs="avc1.42E01E"'
-                const mimeCodec = 'video/webm; codecs="vp8, opus"'; 
+                // 修改为MP4格式以匹配后端
+                const mimeCodec = 'video/mp4; codecs="avc1.42E01E"'; // H.264 baseline profile
                 try {
                     if (MediaSource.isTypeSupported(mimeCodec)) {
+                        console.log('MP4 codec is supported');
                         sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
                         sourceBuffer.addEventListener('updateend', processNextChunk);
                         isMSEInitialized = true;
                         processNextChunk(); // 处理队列中的第一个块
                     } else {
-                        handleGenerationError({ error: 'Unsupported MIME type: ' + mimeCodec });
+                        console.error('MP4 codec not supported, falling back to frame-by-frame');
+                        // 回退到逐帧播放模式
+                        fallbackToFrameMode();
                     }
                 } catch (e) {
-                    handleGenerationError({ error: 'Error creating source buffer: ' + e });
+                    console.error('Error creating source buffer:', e);
+                    fallbackToFrameMode();
                 }
             }, { once: true });
+        }
+
+        // 新增：回退到逐帧播放模式
+        function fallbackToFrameMode() {
+            console.log('Falling back to frame-by-frame playback mode');
+            isVideoMode = false;
+            
+            // 清理MSE相关资源
+            if (mediaSource) {
+                try {
+                    if (mediaSource.readyState === 'open') {
+                        mediaSource.endOfStream();
+                    }
+                } catch (e) {
+                    console.error('Error ending media source:', e);
+                }
+            }
+            mediaSource = null;
+            sourceBuffer = null;
+            isMSEInitialized = false;
+            
+            // 转换视频块为帧数据
+            convertVideoChunksToFrames();
+            
+            // 启动Canvas播放
+            startStreamingPlayback();
+        }
+
+        // 新增：将视频块转换为帧数据（用于回退模式）
+        function convertVideoChunksToFrames() {
+            // 这是一个简化的实现，实际中可能需要更复杂的视频解码
+            // 这里我们假设每个视频块包含多帧，需要提取
+            console.log('Converting video chunks to frames for fallback mode');
+            
+            // 清空帧队列
+            frameQueue = [];
+            
+            // 为每个视频块创建占位帧数据
+            videoChunks.forEach((chunk, chunkIndex) => {
+                // 假设每个块有3帧（根据你的配置）
+                const framesPerChunk = 3;
+                for (let frameIndex = 0; frameIndex < framesPerChunk; frameIndex++) {
+                    frameQueue.push({
+                        session_id: chunk.session_id,
+                        frame_number: chunkIndex * framesPerChunk + frameIndex + 1,
+                        total_frames: chunk.total_chunks * framesPerChunk,
+                        chunk_number: chunkIndex,
+                        progress: chunk.progress,
+                        frame_data: null, // 这里需要从视频块中提取帧数据
+                        block_progress: ((frameIndex + 1) / framesPerChunk) * 100
+                    });
+                }
+            });
+            
+            console.log(`Converted ${videoChunks.length} video chunks to ${frameQueue.length} frames`);
         }
 
         // 新增：处理视频块队列的核心函数
@@ -645,8 +726,12 @@
                 // 如果流已标记为结束，并且没有待处理的块，则正式结束流
                 if (isStreamFinished && videoChunks.length === 0 && sourceBuffer && !sourceBuffer.updating) {
                     if (mediaSource.readyState === 'open') {
-                        mediaSource.endOfStream();
-                        console.log('Media stream ended.');
+                        try {
+                            mediaSource.endOfStream();
+                            console.log('Media stream ended successfully.');
+                        } catch (e) {
+                            console.error('Error ending media stream:', e);
+                        }
                     }
                 }
                 return;
@@ -654,26 +739,60 @@
 
             // 从队列中取出一个数据块
             const chunkData = videoChunks.shift();
+            console.log('Processing video chunk:', {
+                chunk_number: chunkData.chunk_number,
+                total_chunks: chunkData.total_chunks,
+                frames_in_chunk: chunkData.frames_in_chunk,
+                video_data_length: chunkData.video_data ? chunkData.video_data.length : 'undefined'
+            });
             
-            // 后端返回的视频块数据字段名，这里假设是'video_data'，请根据实际情况修改
-            // 如果后端直接返回base64字符串，则使用 chunkData.data
+            // 后端返回的视频块数据字段名
             const videoBase64 = chunkData.video_data; 
             
             if (videoBase64) {
                 try {
                     // Base64解码为Uint8Array
+                    console.log('Decoding base64 video data...');
                     const binaryString = atob(videoBase64);
                     const len = binaryString.length;
                     const bytes = new Uint8Array(len);
                     for (let i = 0; i < len; i++) {
                         bytes[i] = binaryString.charCodeAt(i);
                     }
+                    
+                    console.log(`Decoded ${bytes.length} bytes, appending to source buffer...`);
+                    
                     // 追加到缓冲区
                     sourceBuffer.appendBuffer(bytes);
+                    
+                    // 更新进度信息
+                    updateVideoChunkInfo(chunkData);
+                    
                 } catch (e) {
                     console.error('Error processing video chunk:', e);
+                    console.error('Chunk data:', chunkData);
+                    
+                    // 如果解码失败，尝试回退到逐帧模式
+                    if (videoChunks.length === 0) {
+                        console.log('Switching to fallback mode due to decode error');
+                        fallbackToFrameMode();
+                    }
                 }
+            } else {
+                console.error('No video_data in chunk:', chunkData);
             }
+        }
+
+        // 新增：更新视频块信息显示
+        function updateVideoChunkInfo(data) {
+            document.getElementById('chunkInfo').textContent = 
+                `Chunk: ${data.chunk_number + 1} / ${data.total_chunks}`;
+            document.getElementById('progressInfo').textContent = 
+                `进度: ${Math.round(data.progress)}%`;
+            
+            // 更新进度条
+            const progressFill = document.getElementById('progressFill');
+            progressFill.style.width = data.progress + '%';
         }
 
         // 开始流式播放
@@ -738,8 +857,17 @@
 
         // 更新流式信息
         function updateStreamingInfo(data) {
-            document.getElementById('frameInfo').textContent = `帧数: ${data.frame_number} / ${data.total_frames}`;
-            document.getElementById('progressInfo').textContent = `进度: ${Math.round(data.progress)}%`;
+            document.getElementById('frameInfo').textContent = `帧数: ${data.frame_number} / ${data.total_frames || 'Unknown'}`;
+            document.getElementById('chunkInfo').textContent = `Chunk: ${data.chunk_number + 1} / ${data.total_chunks || 'Unknown'}`;
+            document.getElementById('progressInfo').textContent = `进度: ${Math.round(data.progress || 0)}%`;
+            
+            // 更新进度条
+            const progressFill = document.getElementById('progressFill');
+            const progressText = document.getElementById('progressText');
+            if (data.progress !== undefined) {
+                progressFill.style.width = data.progress + '%';
+                progressText.textContent = `生成中... ${Math.round(data.progress)}%`;
+            }
         }
 
         // 更新进度
@@ -756,39 +884,39 @@
         // 处理生成完成
         function handleGenerationComplete(data) {
             if (data.session_id === currentSessionId) {
-                updateStatus('生成完成，正在结束视频流...', false);
-
-                if (isVideoMode) {
-                    // 如果是视频块模式，标记流结束
-                    isStreamFinished = true;
-                    // 再次调用，以处理队列中剩余的块并最终结束流
-                    processNextChunk();
-                } else {
-                    // 原始的Canvas/逐帧模式逻辑
-                    isGenerating = false;
-                    isPlaying = false;
-                    showMessage('视频生成完成！', 'success');
-                    document.getElementById('progressContainer').style.display = 'none';
-                    displayFinalVideo(data.output_path); // 只有非MSE模式才立即显示
-                    currentSessionId = null;
-                    document.getElementById('generateBtn').disabled = false;
-                    document.getElementById('generateBtn').textContent = '🚀 开始流式生成';
-                }
+                console.log('Generation complete, finishing video stream...');
+                updateStatus('生成完成！', false);
                 
-                // 对于MSE模式，可以在 'sourceended' 事件中执行清理工作
-                if (mediaSource) {
-                    mediaSource.addEventListener('sourceended', () => {
-                        console.log('Playback finished.');
-                        isGenerating = false;
-                        showMessage('视频播放完成！', 'success');
-                        document.getElementById('progressContainer').style.display = 'none';
-                        // 可选：此时再显示服务器上保存的完整文件
-                        // displayFinalVideo(data.output_path); 
-                        currentSessionId = null;
-                        document.getElementById('generateBtn').disabled = false;
-                        document.getElementById('generateBtn').textContent = '🚀 开始流式生成';
-                    }, { once: true });
-                }
+                // 停止播放循环
+                isPlaying = false;
+                
+                // 等待一段时间让剩余帧播放完成
+                setTimeout(() => {
+                    finishGeneration();
+                }, 2000);
+            }
+        }
+
+        // 新增：完成生成的清理工作
+        function finishGeneration() {
+            console.log('Finishing generation and cleaning up...');
+            isGenerating = false;
+            isPlaying = false;
+            
+            showMessage('视频生成完成！', 'success');
+            document.getElementById('progressContainer').style.display = 'none';
+            document.getElementById('streamingInfo').style.display = 'none';
+            
+            // 重置UI
+            currentSessionId = null;
+            document.getElementById('generateBtn').disabled = false;
+            document.getElementById('generateBtn').textContent = '🚀 开始流式生成';
+            
+            // 显示最终的视频播放器（如果有的话）
+            const videoPlayer = document.getElementById('videoPlayer');
+            if (videoPlayer.src && videoPlayer.src !== '') {
+                videoPlayer.style.display = 'block';
+                console.log('Final video is ready for playback');
             }
         }
 
@@ -945,13 +1073,14 @@
 
             // 重置状态
             frameQueue = [];
-            videoChunks = []; // 确保 videoChunks 也被重置
+            videoChunks = [];
             isPlaying = false;
             isGenerating = true;
-            isStreamFinished = false; // 重置流结束标志
-            isMSEInitialized = false; // 重置MSE初始化标志
+            isVideoMode = false; // 默认使用逐帧模式
+            isStreamFinished = false;
+            isMSEInitialized = false;
 
-            // 尝试安全地关闭上一个MediaSource连接
+            // 清理MediaSource相关资源
             if (mediaSource && mediaSource.readyState === 'open') {
                 try {
                     mediaSource.endOfStream();

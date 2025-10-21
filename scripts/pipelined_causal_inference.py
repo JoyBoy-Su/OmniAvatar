@@ -161,6 +161,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
             raise ValueError
         
         # Step 3: temporal denoising loop
+        print(f"NUM BLOCKS is {num_blocks}")
         all_num_frames = [self.args.num_frame_per_block] * num_blocks
         total_frames_generated = 0
         for current_num_frames in all_num_frames:
@@ -355,7 +356,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 # Step 3.2: record the model's output
                 if current_start_frame == 0:
                     denoised_pred[:, :1] = img_lat[:, :16, :1].permute(0, 2, 1, 3, 4)
-                output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
+                output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred # latents: denoised_pred
                 
                 # Step 3.3: return with timestep zero to update KV cache using clean context
                 context_timestep = torch.ones_like(timestep) * 0
@@ -377,7 +378,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 # Add VAE decoding task (video is already decoded by causal_pipe.inference)
                 # But we still need to process it for streaming
                 task.update({
-                    "output": output.clone()
+                    "latents": denoised_pred.clone()
                 })
                 self.vae_queue.put(task)
                 
@@ -402,11 +403,16 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 chunk_id = task["chunk_id"]
                 print(f"Processing video formatting for block {chunk_id}")
                 
-                output: torch.Tensor = task["output"]
+                latents: torch.Tensor = task["latents"]
                 # decoding
-                output = output.permute(0, 2, 1, 3, 4)
-                output.to("cuda:1")
-                video = self.causal_pipe.vae.decode(output, device="cuda:1")
+                latents = latents.permute(0, 2, 1, 3, 4)
+                latents = latents.to("cuda:1")
+                video = self.causal_pipe.vae.decode(latents, device="cuda:1").permute(0, 2, 1, 3, 4)
+                
+                # Ensure video is in float32 for compatibility with numpy conversion
+                print(f"Video before float conversion - dtype: {video.dtype}, shape: {video.shape}")
+                video = video.float()
+                print(f"Video after float conversion - dtype: {video.dtype}, shape: {video.shape}")
                 # Store result in buffer with lock
                 task.update({"video": video})
                 with self.result_lock:
@@ -425,7 +431,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
     def _send_chunk_frames(self, chunk_id, streaming_callback, session_id, total_frames_generated, total_blocks):
         if chunk_id < 0:
             return 0
-        """Send frames for a completed block"""
+        """Send frames for a completed block using frame-by-frame method"""
         print(f"Sending block {chunk_id} frames")
         
         # Wait for result to be available
@@ -438,150 +444,57 @@ class PipelinedCausalInferencePipeline(nn.Module):
         if streaming_callback is None:
             return total_frames_generated + video.shape[1]
         
-        try:
-            # Convert video tensor to frames and create video chunk
-            video_base64 = self._create_video_chunk(video)
-            
-            total_frames_generated += video.shape[1]
-            progress_overall = (total_frames_generated / (total_blocks * self.args.num_frame_per_block)) * 100
-            
-            streaming_callback({
-                "type": "video_chunk",
-                "session_id": session_id,
-                "video_data": video_base64,
-                "block_number": chunk_id,
-                "total_blocks": total_blocks,
-                "progress": progress_overall,
-                "frames_in_block": video.shape[1],
-                "message": f"Block {chunk_id} completed (causal pipelined)"
-            })
-            
-        except Exception as e:
-            print(f"Error creating video chunk for block {chunk_id}: {e}")
-            # Fallback to frame-by-frame sending
-            total_frames_generated = self._send_frames_fallback(
-                video, chunk_id, streaming_callback, 
-                session_id, total_frames_generated, total_blocks
-            )
+        # 直接使用逐帧发送方式，避免视频流同步问题
+        print(f"Using frame-by-frame method for chunk {chunk_id}")
+        total_frames_generated = self._send_frames_fallback(
+            video, chunk_id, streaming_callback, 
+            session_id, total_frames_generated, total_blocks
+        )
         
         return total_frames_generated
 
-    def _create_video_chunk(self, video):
-        """Create a video chunk from video tensor"""
-        # Convert video tensor to numpy
-        video_np = (video.squeeze(0).permute(1, 2, 3, 0).cpu().float().numpy() * 255).astype(np.uint8)
-        
-        # Create a simple MP4 video chunk using imageio or cv2
-        import imageio
-        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
-            imageio.mimsave(tmp_file.name, video_np, fps=getattr(self.args, 'fps', 16))
-            
-            # Read the video file and encode as base64
-            with open(tmp_file.name, 'rb') as f:
-                video_bytes = f.read()
-            
-            # Clean up temp file
-            os.unlink(tmp_file.name)
-            
-            video_base64 = base64.b64encode(video_bytes).decode('utf-8')
-            return video_base64
-
     def _send_frames_fallback(self, video, chunk_id, streaming_callback, session_id, total_frames_generated, total_blocks):
-        """Fallback method: send frames one by one"""
-        print(f"Using fallback method for block {chunk_id}")
+        """Frame-by-frame sending method (following pipelined_inference.py pattern)"""
+        print(f"Using frame-by-frame method for chunk {chunk_id}")
         
+        total_frames = total_blocks * self.args.num_frame_per_block
+        # import pdb; pdb.set_trace()
         for frame_idx in range(video.shape[1]):
             frame_data = video[:, frame_idx]
-            # Convert to base64
-            frame_np = (frame_data.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype('uint8')
+            # Convert to base64 (same as pipelined_inference.py)
+            # First convert bfloat16 to float32, then to numpy
+            print(f"Frame {frame_idx} data type: {frame_data.dtype}, shape: {frame_data.shape}")
+            frame_np = (frame_data.squeeze(0).permute(1, 2, 0).cpu().float().numpy() * 255).astype('uint8')
             frame_pil = Image.fromarray(frame_np)
             buffer = io.BytesIO()
             frame_pil.save(buffer, format='JPEG', quality=85)
             frame_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
             
             total_frames_generated += 1
-            progress_overall = (total_frames_generated / (total_blocks * self.args.num_frame_per_block)) * 100
+            progress_overall = (total_frames_generated / total_frames) * 100 if total_frames else None
             
             streaming_callback({
                 "type": "video_frame",
                 "session_id": session_id,
                 "frame_data": frame_base64,
                 "frame_number": total_frames_generated,
-                "block_number": chunk_id,
+                "total_frames": total_frames,
+                "chunk_number": chunk_id,
                 "progress": progress_overall,
-                "block_progress": ((frame_idx + 1) / video.shape[1]) * 100
+                "chunk_progress": ((frame_idx + 1) / video.shape[1]) * 100
             })
         
-        # Block complete
+        # Chunk complete (same format as pipelined_inference.py)
+        progress_overall_after_chunk = (total_frames_generated / total_frames) * 100 if total_frames else None
         streaming_callback({
-            "type": "block_complete",
+            "type": "chunk_complete",
             "session_id": session_id,
-            "block_number": chunk_id,
-            "total_blocks": total_blocks,
-            "frames_in_block": video.shape[1],
+            "chunk_number": chunk_id,
+            "total_chunks": total_blocks,
+            "frames_in_chunk": video.shape[1],
             "total_frames_generated": total_frames_generated,
-            "progress": (total_frames_generated / (total_blocks * self.args.num_frame_per_block)) * 100,
-            "message": f"Block {chunk_id} completed (causal pipelined)"
+            "progress": progress_overall_after_chunk,
+            "message": f"Chunk {chunk_id} completed (causal pipelined)"
         })
         
         return total_frames_generated
-
-
-# def main():
-#     """Main function to test the pipelined causal inference pipeline."""
-#     torch.set_grad_enabled(False)
-#     args = parse_args()
-#     # Set device based on rank
-#     device = torch.device(f"cuda:{getattr(args, 'rank', 0)}")
-    
-#     # Create pipelined causal inference pipeline
-#     pipeline = PipelinedCausalInferencePipeline(args)
-#     print("Pipelined causal inference pipeline initialized successfully!")
-    
-#     # Prepare test parameters
-#     text_prompts = getattr(args, 'prompt', "A realistic video of a man speaking directly to the camera on a sofa, with dynamic and rhythmic hand gestures that complement his speech.")
-    
-#     print(f"Text prompts: {text_prompts}")
-    
-#     # Test streaming callback
-#     def test_streaming_callback(data):
-#         print(f"Streaming callback: {data['type']} - {data.get('message', '')}")
-    
-#     # Perform pipelined causal inference
-#     print("Starting pipelined causal inference...")
-    
-#     results = pipeline(
-#         prompt=text_prompts,
-#         image_path="/data2/jdsu/projects/OmniAvatar/examples/images/0000.jpeg",
-#         audio_path="/data2/jdsu/projects/OmniAvatar/examples/audios/0000.MP3",
-#         num_blocks=7,
-#         frames_per_block=3,
-#         streaming_callback=test_streaming_callback,
-#         session_id="test_session",
-#         return_latents=False
-#     )
-    
-#     print(f"Generated {len(results)} blocks")
-    
-#     # Save results
-#     output_path = "generated_causal_pipelined_video.mp4"
-#     if results:
-#         # Concatenate all video blocks
-#         all_videos = []
-#         for result in results:
-#             all_videos.append(result["video"])
-        
-#         # Concatenate along time dimension
-#         final_video = torch.cat(all_videos, dim=1)
-        
-#         # Save video
-#         import imageio
-#         video_np = (final_video.squeeze(0).permute(1, 2, 3, 0).cpu().float().numpy() * 255).astype(np.uint8)
-#         imageio.mimsave(output_path, video_np, fps=getattr(args, 'fps', 16))
-#         print(f"Video saved to: {output_path}")
-    
-#     print("Pipelined causal inference completed successfully!")
-
-
-# if __name__ == "__main__":
-#     main()

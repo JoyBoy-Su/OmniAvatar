@@ -128,7 +128,9 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
                 image_path=image_path,
                 audio_path=audio_path,
                 initial_latent=None,
-                return_latents=False
+                return_latents=False,
+                streaming_callback=streaming_callback,
+                session_id=session_id
             )
             
             # Process causal results
