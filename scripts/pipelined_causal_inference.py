@@ -198,8 +198,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
         self.vae_events[self.current_clock - 1].wait()
         # send the last chunk, TODO: update interface
         total_frames_generated = self._send_chunk_frames(self.current_clock - 1, streaming_callback, session_id, total_frames_generated, num_blocks)
-        
-            
+  
     @torch.no_grad()
     def forward(
         self,
@@ -377,6 +376,11 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 
                 # Add VAE decoding task (video is already decoded by causal_pipe.inference)
                 # But we still need to process it for streaming
+                # if current_start_frame > 0:
+                #     task.update({
+                #         "latents": output[:, current_start_frame - 1:current_start_frame + current_num_frames].clone()
+                #     })
+                # else:
                 task.update({
                     "latents": denoised_pred.clone()
                 })
@@ -405,10 +409,11 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 
                 latents: torch.Tensor = task["latents"]
                 # decoding
-                latents = latents.permute(0, 2, 1, 3, 4)
+                latents = latents.permute(0, 2, 1, 3, 4)    # (b, c, t, h, w)
                 latents = latents.to("cuda:1")
                 video = self.causal_pipe.vae.decode(latents, device="cuda:1").permute(0, 2, 1, 3, 4)
-                
+                # video = video[:, :, 1:].permute(0, 2, 1, 3, 4)
+                # video = video[:, :, 1:]
                 # Ensure video is in float32 for compatibility with numpy conversion
                 print(f"Video before float conversion - dtype: {video.dtype}, shape: {video.shape}")
                 video = video.float()
@@ -440,6 +445,13 @@ class PipelinedCausalInferencePipeline(nn.Module):
         
         block_data = self.result_buffer[chunk_id]
         video = block_data["video"]
+        # print(f"video: {video.shape}")
+        # output_path = f"generated_video_{chunk_id}.mp4"
+        # video_np = (video.squeeze(0).permute(1, 2, 3, 0).cpu().float().numpy() * 255).astype(np.uint8)
+        # import imageio
+        # print(f"video np: {video_np.shape}")
+        # imageio.mimsave(output_path, video_np, fps=16)
+        # print(f"Video saved to: {output_path}")
         
         if streaming_callback is None:
             return total_frames_generated + video.shape[1]
@@ -466,6 +478,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
             print(f"Frame {frame_idx} data type: {frame_data.dtype}, shape: {frame_data.shape}")
             frame_np = (frame_data.squeeze(0).permute(1, 2, 0).cpu().float().numpy() * 255).astype('uint8')
             frame_pil = Image.fromarray(frame_np)
+            # frame_pil.save(f"examples/frame_{frame_idx}.png")
             buffer = io.BytesIO()
             frame_pil.save(buffer, format='JPEG', quality=85)
             frame_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')

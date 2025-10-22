@@ -430,10 +430,11 @@ class Decoder3d(nn.Module):
                                   CausalConv3d(out_dim, 3, 3, padding=1))
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        # import pdb; pdb.set_trace()
         ## conv1
         if feat_cache is not None:
             idx = feat_idx[0]
-            cache_x = x[:, :, -CACHE_T:, :, :].clone()
+            cache_x = x[:, :, -CACHE_T:, :, :].clone()  # x: (batch_size, channel, t(latent space), h, w)
             if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
                 # cache last frame of last two chunk
                 cache_x = torch.cat([
@@ -550,6 +551,7 @@ class VideoVAE_(nn.Module):
         return mu
 
     def decode(self, z, scale):
+        # import pdb; pdb.set_trace()
         self.clear_cache()
         # z: [b,c,t,h,w]
         if isinstance(scale[0], torch.Tensor):
@@ -572,6 +574,7 @@ class VideoVAE_(nn.Module):
                                     feat_cache=self._feat_map,
                                     feat_idx=self._conv_idx)
                 out = torch.cat([out, out_], 2) # may add tensor offload
+        # import pdb; pdb.set_trace()
         return out
 
     def reparameterize(self, mu, log_var):

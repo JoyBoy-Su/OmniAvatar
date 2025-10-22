@@ -192,16 +192,16 @@ class CausalInferencePipeline(torch.nn.Module):
         Returns:
             Generated video tensor [batch_size, num_frames, channels, height, width]
         """
+        self.vae.to(self.device)
         with torch.no_grad():
             batch_size, num_frames, num_channels, height, width = noise.shape
-        
-        
             # Frame block calculations
             assert num_frames % self.num_frame_per_block == 0
             num_blocks = num_frames // self.num_frame_per_block
             
             num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
             num_output_frames = num_frames + num_input_frames
+            import pdb; pdb.set_trace()
             
             # Text conditioning
             self.text_encoder.to("cuda")
@@ -248,6 +248,8 @@ class CausalInferencePipeline(torch.nn.Module):
             # Step 3: Temporal denoising loop
             all_num_frames = [self.num_frame_per_block] * num_blocks
 
+            videos = []
+
             for current_num_frames in all_num_frames:
                 print(f"Processing frame {current_start_frame - num_input_frames} to {current_start_frame + current_num_frames - num_input_frames}.")
                 noisy_input = noise[
@@ -279,21 +281,20 @@ class CausalInferencePipeline(torch.nn.Module):
                         
                         next_timestep = self.denoising_step_list[index + 1]
 
-                        #noisy_input = self.scheduler.step(v, current_timestep,noisy_input)
-                        
-                        
                         noisy_input = self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
                             torch.randn_like(denoised_pred.flatten(0, 1)),
                             next_timestep * torch.ones([batch_size * current_num_frames], device=noise.device, dtype=torch.long)
                         ).unflatten(0, denoised_pred.shape[:2])
                         
-                        
+                print(f"denoised_pred: {denoised_pred.shape}")
                 # Step 3.2: record the model's output
                 if current_start_frame==0:
                         denoised_pred[:, :1] = img_lat[:, :16, :1].permute(0,2,1,3,4)
                 output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
-
+                print(f"output: {output.shape}")
+                # videos.append(self.vae.decode(denoised_pred.permute(0,2,1,3,4), device=self.device))
+                # print(f"new video clip: {videos[-1].shape}")
                 # Step 3.3: rerun with timestep zero to update KV cache using clean context
                 context_timestep = torch.ones_like(timestep) * 0
                 self.generator_forward(
@@ -310,9 +311,28 @@ class CausalInferencePipeline(torch.nn.Module):
             
             # Decode to video
             output=output.permute(0,2,1,3,4)
+            print(f"output: {output.shape}")
             self.vae.to(output.device)
+            videos = []
+            for start_frame in range(0, output.shape[2], self.num_frame_per_block):
+                if start_frame == 0:
+                    decode_latents = output[:, :, start_frame:start_frame + self.num_frame_per_block]
+                    print(f"decode_latents: {decode_latents.shape}")
+                    video_clip = self.vae.decode(decode_latents, device=self.device)
+                    print(f"video_clip: {video_clip.shape}")
+                    videos.append(video_clip)
+                else:
+                    decode_latents = output[:, :, start_frame-1:start_frame + self.num_frame_per_block]
+                    print(f"decode_latents: {decode_latents.shape}")
+                    video_clip = self.vae.decode(decode_latents, device=self.device)
+                    video_clip = video_clip[:, :, 1:]
+                    print(f"video_clip: {video_clip.shape}")
+                    videos.append(video_clip)
+            # print(f"videos length: {len(videos)}")
+            video = torch.concat(videos, dim=2) # (videos item: (batch_size, channel, frames, h, w))
             video = self.vae.decode(output,device=self.device)
             video = (video * 0.5 + 0.5).clamp(0, 1)
+            print(f"type: {type(video)}, {video.shape}")
         
         if return_latents:
             return video, output
@@ -505,8 +525,8 @@ def main():
     
     video=pipeline(noise=noise,
         text_prompts=text_prompts,
-        image_path="/data2/jdsu/projects/OmniAvatar/examples/images/0000.jpeg",
-        audio_path="/data2/jdsu/projects/OmniAvatar/examples/audios/0000.MP3",
+        image_path="/data2/jdsu/projects/OmniAvatar/examples/images/0001.jpeg",
+        audio_path="/data2/jdsu/projects/OmniAvatar/examples/audios/0001.MP3",
         initial_latent=None,
         return_latents=return_latents)
     '''
@@ -521,7 +541,7 @@ def main():
     
     # Save generated video
     import imageio
-    output_path = "generated_video_debug_fm_style.mp4"
+    output_path = "generated_video_debug_concat.mp4"
     video_np = (video.squeeze(0).permute(1, 2, 3, 0).cpu().float().numpy() * 255).astype(np.uint8)
     imageio.mimsave(output_path, video_np, fps=getattr(args, 'fps', 16))
     print(f"Video saved to: {output_path}")
