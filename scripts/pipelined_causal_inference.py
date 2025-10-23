@@ -257,7 +257,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                     self.causal_pipe.wav_feature_extractor(audio, sampling_rate=16000).input_values
                 )
             input_values = torch.from_numpy(input_values).float().to(device=self.device)
-            audio_len = 81
+            audio_len = (noise.shape[1] - 1) * 4 + 1
             input_values = input_values.unsqueeze(0)
             
             with torch.no_grad():
@@ -453,8 +453,8 @@ class PipelinedCausalInferencePipeline(nn.Module):
         # imageio.mimsave(output_path, video_np, fps=16)
         # print(f"Video saved to: {output_path}")
         
-        if streaming_callback is None:
-            return total_frames_generated + video.shape[1]
+        # if streaming_callback is None:
+        #     return total_frames_generated + video.shape[1]
         
         # 直接使用逐帧发送方式，避免视频流同步问题
         print(f"Using frame-by-frame method for chunk {chunk_id}")
@@ -463,13 +463,13 @@ class PipelinedCausalInferencePipeline(nn.Module):
             session_id, total_frames_generated, total_blocks
         )
         
-        return total_frames_generated
+        return total_frames_generated + video.shape[1]
 
     def _send_frames_fallback(self, video, chunk_id, streaming_callback, session_id, total_frames_generated, total_blocks):
         """Frame-by-frame sending method (following pipelined_inference.py pattern)"""
         print(f"Using frame-by-frame method for chunk {chunk_id}")
-        
-        total_frames = total_blocks * self.args.num_frame_per_block
+        # import pdb; pdb.set_trace()
+        total_frames = (total_blocks * self.args.num_frame_per_block - 1) * 4 + 1
         # import pdb; pdb.set_trace()
         for frame_idx in range(video.shape[1]):
             frame_data = video[:, frame_idx]

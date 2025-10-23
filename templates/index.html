@@ -303,6 +303,53 @@
             color: white;
         }
 
+        .audio-controls-panel {
+            position: fixed;
+            top: 70px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            z-index: 1000;
+            display: none;
+            min-width: 200px;
+        }
+
+        .audio-controls-panel h4 {
+            margin: 0 0 10px 0;
+            font-size: 1em;
+        }
+
+        .audio-control-btn {
+            background: #4facfe;
+            color: white;
+            border: none;
+            padding: 8px 12px;
+            border-radius: 5px;
+            margin: 5px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+
+        .audio-control-btn:hover {
+            background: #3a8bfe;
+        }
+
+        .audio-control-btn:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+
+        .volume-control {
+            margin: 10px 0;
+        }
+
+        .volume-slider {
+            width: 100%;
+            margin: 5px 0;
+        }
+
         @media (max-width: 768px) {
             .input-section {
                 grid-template-columns: 1fr;
@@ -389,6 +436,7 @@
                     <div id="frameInfo">帧数: 0 / 0</div>
                     <div id="chunkInfo">Chunk: 0 / 0</div>
                     <div id="progressInfo">进度: 0%</div>
+                    <div id="audioInfo">🔊 音频: 待播放</div>
                 </div>
             </div>
         </div>
@@ -397,6 +445,21 @@
     <!-- 连接状态指示器 -->
     <div id="connectionStatus" class="connection-status disconnected">
         🔴 未连接
+    </div>
+
+    <!-- 音频控制面板 -->
+    <div id="audioControlsPanel" class="audio-controls-panel">
+        <h4>🔊 音频控制</h4>
+        <div>
+            <button id="muteBtn" class="audio-control-btn" onclick="toggleMute()">🔇 静音</button>
+            <button id="audioResetBtn" class="audio-control-btn" onclick="resetAudio()">🔄 重置</button>
+        </div>
+        <div class="volume-control">
+            <label>音量:</label>
+            <input type="range" id="volumeSlider" class="volume-slider" min="0" max="100" value="50" onchange="updateVolume()">
+            <span id="volumeValue">50%</span>
+        </div>
+        <div id="audioStatus" style="font-size: 0.8em; margin-top: 10px;">音频就绪</div>
     </div>
 
     <script>
@@ -422,6 +485,16 @@
         let sourceBuffer = null;
         let isMSEInitialized = false;
         let isStreamFinished = false;
+
+        // 音频播放相关变量
+        let audioContext = null;
+        let audioQueue = [];
+        let isAudioPlaying = false;
+        let audioStartTime = 0;
+        let currentAudioSource = null;
+        let audioGainNode = null;
+        let isMuted = false;
+        let audioVolume = 0.5;
 
         // 固定prompt值
         const prompt = "A person speaking naturally with lip sync to the audio";
@@ -534,7 +607,8 @@
                 frame_number: data.frame_number,
                 total_frames: data.total_frames,
                 chunk_number: data.chunk_number,
-                progress: data.progress
+                progress: data.progress,
+                has_audio: !!data.audio_segment
             });
 
             if (data.session_id === currentSessionId) {
@@ -546,6 +620,11 @@
                 // 将帧添加到队列
                 frameQueue.push(data);
                 console.log('Frame added to queue. Queue length:', frameQueue.length);
+
+                // 处理音频片段
+                if (data.audio_segment) {
+                    handleAudioSegment(data);
+                }
 
                 // 如果还没有开始播放，开始播放
                 if (!isPlaying) {
@@ -562,7 +641,13 @@
 
         // 处理视频块（新的视频+音频模式）
         function handleVideoChunk(data) {
-            console.log('handleVideoChunk called with data:', data);
+            console.log('handleVideoChunk called with data:', {
+                session_id: data.session_id,
+                chunk_number: data.chunk_number,
+                total_chunks: data.total_chunks,
+                has_video: !!data.video_data,
+                has_audio: !!data.audio_segment
+            });
             
             if (data.session_id === currentSessionId) {
                 console.log('Session ID matches! Processing video chunk:', data.chunk_number, '/', data.total_chunks);
@@ -575,6 +660,11 @@
 
                 isVideoMode = true;
                 videoChunks.push(data);
+                
+                // 处理音频片段
+                if (data.audio_segment) {
+                    handleAudioSegment(data);
+                }
                 
                 if (!isPlaying) {
                     isPlaying = true; // 设置播放状态
@@ -795,6 +885,210 @@
             progressFill.style.width = data.progress + '%';
         }
 
+        // 新增：处理音频片段
+        function handleAudioSegment(data) {
+            if (!data.audio_segment) return;
+            
+            console.log('Processing audio segment for frame/chunk:', data.frame_number || data.chunk_number);
+            
+            try {
+                // 初始化音频上下文（如果还没有）
+                if (!audioContext) {
+                    initializeAudioContext();
+                }
+                
+                // 解码base64音频数据
+                const audioData = base64ToArrayBuffer(data.audio_segment);
+                
+                // 将音频片段添加到队列
+                audioQueue.push({
+                    data: audioData,
+                    startTime: data.audio_start_time || 0,
+                    duration: data.audio_duration || 0.04, // 默认40ms（25fps）
+                    frameNumber: data.frame_number || data.chunk_number
+                });
+                
+                // 如果还没有开始播放音频，开始播放
+                if (!isAudioPlaying) {
+                    startAudioPlayback();
+                }
+                
+            } catch (error) {
+                console.error('Error processing audio segment:', error);
+            }
+        }
+
+        // 新增：初始化音频上下文
+        function initializeAudioContext() {
+            try {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                
+                // 创建音量控制节点
+                audioGainNode = audioContext.createGain();
+                audioGainNode.connect(audioContext.destination);
+                audioGainNode.gain.value = audioVolume;
+                
+                console.log('Audio context initialized');
+                
+                // 显示音频控制面板
+                document.getElementById('audioControlsPanel').style.display = 'block';
+                updateAudioControlStatus('音频系统已初始化');
+                
+            } catch (error) {
+                console.error('Failed to initialize audio context:', error);
+                updateAudioControlStatus('音频初始化失败');
+            }
+        }
+
+        // 新增：开始音频播放
+        function startAudioPlayback() {
+            if (!audioContext || audioQueue.length === 0) return;
+            
+            isAudioPlaying = true;
+            audioStartTime = audioContext.currentTime;
+            console.log('Starting audio playback...');
+            
+            // 更新音频状态显示
+            updateAudioStatus('🔊 音频: 正在播放');
+            
+            // 处理音频队列
+            processAudioQueue();
+        }
+
+        // 新增：处理音频队列
+        function processAudioQueue() {
+            if (!isAudioPlaying || audioQueue.length === 0) return;
+            
+            const audioSegment = audioQueue.shift();
+            
+            // 解码音频数据
+            audioContext.decodeAudioData(audioSegment.data.slice())
+                .then(audioBuffer => {
+                    // 创建音频源
+                    const source = audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(audioGainNode); // 连接到音量控制节点
+                    
+                    // 计算播放时间
+                    const playTime = audioStartTime + audioSegment.startTime;
+                    const currentTime = audioContext.currentTime;
+                    const delay = Math.max(0, playTime - currentTime);
+                    
+                    console.log(`Playing audio segment for frame ${audioSegment.frameNumber}, delay: ${delay}s`);
+                    
+                    // 播放音频
+                    source.start(currentTime + delay);
+                    currentAudioSource = source;
+                    
+                    // 设置结束回调
+                    source.onended = () => {
+                        // 继续处理下一个音频片段
+                        setTimeout(() => {
+                            processAudioQueue();
+                        }, 10);
+                    };
+                })
+                .catch(error => {
+                    console.error('Error decoding audio data:', error);
+                    // 继续处理下一个音频片段
+                    setTimeout(() => {
+                        processAudioQueue();
+                    }, 10);
+                });
+        }
+
+        // 新增：停止音频播放
+        function stopAudioPlayback() {
+            isAudioPlaying = false;
+            audioQueue = [];
+            
+            if (currentAudioSource) {
+                try {
+                    currentAudioSource.stop();
+                } catch (e) {
+                    // 忽略已经停止的音频源错误
+                }
+                currentAudioSource = null;
+            }
+            
+            // 更新音频状态显示
+            updateAudioStatus('🔊 音频: 已停止');
+            
+            console.log('Audio playback stopped');
+        }
+
+        // 新增：更新音频状态显示
+        function updateAudioStatus(status) {
+            const audioInfo = document.getElementById('audioInfo');
+            if (audioInfo) {
+                audioInfo.textContent = status;
+            }
+        }
+
+        // 新增：Base64转ArrayBuffer
+        function base64ToArrayBuffer(base64) {
+            const binaryString = atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        // 音频控制函数
+        function toggleMute() {
+            if (!audioGainNode) return;
+            
+            isMuted = !isMuted;
+            const muteBtn = document.getElementById('muteBtn');
+            
+            if (isMuted) {
+                audioGainNode.gain.value = 0;
+                muteBtn.textContent = '🔊 取消静音';
+                updateAudioControlStatus('音频已静音');
+            } else {
+                audioGainNode.gain.value = audioVolume;
+                muteBtn.textContent = '🔇 静音';
+                updateAudioControlStatus('音频已恢复');
+            }
+        }
+
+        function updateVolume() {
+            const slider = document.getElementById('volumeSlider');
+            const volumeValue = document.getElementById('volumeValue');
+            
+            audioVolume = slider.value / 100;
+            volumeValue.textContent = slider.value + '%';
+            
+            if (audioGainNode && !isMuted) {
+                audioGainNode.gain.value = audioVolume;
+            }
+            
+            updateAudioControlStatus(`音量设置为 ${slider.value}%`);
+        }
+
+        function resetAudio() {
+            // 停止当前音频播放
+            stopAudioPlayback();
+            
+            // 重置音频队列
+            audioQueue = [];
+            
+            // 重置音频状态
+            isAudioPlaying = false;
+            
+            updateAudioControlStatus('音频已重置');
+            updateAudioStatus('🔊 音频: 已重置');
+        }
+
+        function updateAudioControlStatus(message) {
+            const status = document.getElementById('audioStatus');
+            if (status) {
+                status.textContent = message;
+            }
+        }
+
         // 开始流式播放
         function startStreamingPlayback() {
             if (!canvas) {
@@ -808,6 +1102,11 @@
             canvas.style.display = 'block';
             document.getElementById('videoPlaceholder').style.display = 'none';
             document.getElementById('streamingInfo').style.display = 'block';
+            
+            // 确保音频控制面板显示
+            if (audioContext) {
+                document.getElementById('audioControlsPanel').style.display = 'block';
+            }
             
             // 开始播放循环
             playNextFrame();
@@ -903,9 +1202,17 @@
             isGenerating = false;
             isPlaying = false;
             
-            showMessage('视频生成完成！', 'success');
+            // 停止音频播放
+            stopAudioPlayback();
+            
+            showMessage('视频生成完成！音频已同步播放', 'success');
             document.getElementById('progressContainer').style.display = 'none';
             document.getElementById('streamingInfo').style.display = 'none';
+            
+            // 隐藏音频控制面板
+            setTimeout(() => {
+                document.getElementById('audioControlsPanel').style.display = 'none';
+            }, 3000); // 3秒后隐藏
             
             // 重置UI
             currentSessionId = null;
@@ -925,6 +1232,9 @@
             if (data.session_id === currentSessionId) {
                 isGenerating = false;
                 isPlaying = false;
+                
+                // 停止音频播放
+                stopAudioPlayback();
                 
                 showMessage('生成失败: ' + data.error, 'error');
                 updateStatus('生成失败', false);
@@ -1079,6 +1389,11 @@
             isVideoMode = false; // 默认使用逐帧模式
             isStreamFinished = false;
             isMSEInitialized = false;
+            
+            // 重置音频状态
+            stopAudioPlayback();
+            audioQueue = [];
+            isAudioPlaying = false;
 
             // 清理MediaSource相关资源
             if (mediaSource && mediaSource.readyState === 'open') {

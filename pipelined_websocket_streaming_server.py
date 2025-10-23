@@ -201,12 +201,127 @@ def streaming_callback(data):
             return
 
         event_type = data.get('type')
+        
+        # 如果是视频帧数据，尝试添加对应的音频片段
+        if event_type == 'video_frame' and 'frame_number' in data:
+            # 添加音频片段信息到数据中
+            add_audio_segment_to_frame(data, session_id)
+        elif event_type == 'video_chunk' and 'chunk_number' in data:
+            # 为视频块添加音频片段
+            add_audio_segment_to_chunk(data, session_id)
+        
         # Send data to frontend via WebSocket
         socketio.emit(event_type, data, room=session_id)
 
     except Exception as e:
         print(f"[PIPELINED_BACKEND] Error in streaming callback: {e}")
         traceback.print_exc()
+
+def add_audio_segment_to_frame(data, session_id):
+    # import pdb; pdb.set_trace()
+    """为视频帧添加对应的音频片段"""
+    try:
+        # 获取当前会话的音频信息
+        if session_id in active_sessions:
+            session_info = active_sessions[session_id]
+            audio_path = session_info.get('reply_audio_path')
+            
+            if audio_path and os.path.exists(audio_path):
+                frame_number = data.get('frame_number', 0)
+                total_frames = data.get('total_frames', 1)
+                
+                # 计算音频片段的时间范围（假设25fps）
+                fps = 16
+                frame_duration = 1.0 / fps
+                start_time = (frame_number - 1) * frame_duration
+                end_time = frame_number * frame_duration
+                
+                # 提取音频片段
+                audio_segment = extract_audio_segment(audio_path, start_time, end_time)
+                if audio_segment:
+                    data['audio_segment'] = audio_segment
+                    data['audio_start_time'] = start_time
+                    data['audio_duration'] = frame_duration
+                    
+    except Exception as e:
+        print(f"Error adding audio segment to frame: {e}")
+
+def add_audio_segment_to_chunk(data, session_id):
+    # import pdb; pdb.set_trace()
+    """为视频块添加对应的音频片段"""
+    try:
+        # 获取当前会话的音频信息
+        if session_id in active_sessions:
+            session_info = active_sessions[session_id]
+            audio_path = session_info.get('reply_audio_path')
+            
+            if audio_path and os.path.exists(audio_path):
+                chunk_number = data.get('chunk_number', 0)
+                frames_in_chunk = data.get('frames_in_chunk', 3)
+                
+                # 计算音频片段的时间范围（假设25fps）
+                fps = 16
+                frame_duration = 1.0 / fps
+                chunk_duration = frames_in_chunk * frame_duration
+                start_time = chunk_number * chunk_duration
+                end_time = start_time + chunk_duration
+                
+                # 提取音频片段
+                audio_segment = extract_audio_segment(audio_path, start_time, end_time)
+                if audio_segment:
+                    data['audio_segment'] = audio_segment
+                    data['audio_start_time'] = start_time
+                    data['audio_duration'] = chunk_duration
+                    
+    except Exception as e:
+        print(f"Error adding audio segment to chunk: {e}")
+
+def extract_audio_segment(audio_path, start_time, end_time):
+    """提取音频片段并转换为base64"""
+    try:
+        import soundfile as sf
+        
+        # 读取音频文件
+        audio_data, sample_rate = sf.read(audio_path)
+        
+        # 计算样本索引
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+        
+        # 确保索引在有效范围内
+        start_sample = max(0, start_sample)
+        end_sample = min(len(audio_data), end_sample)
+        
+        if start_sample >= end_sample:
+            return None
+            
+        # 提取音频片段
+        audio_segment = audio_data[start_sample:end_sample]
+        
+        # 如果音频是立体声，转换为单声道
+        if len(audio_segment.shape) > 1:
+            audio_segment = np.mean(audio_segment, axis=1)
+        
+        # 转换为16位整数
+        audio_segment = (audio_segment * 32767).astype(np.int16)
+        
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+            sf.write(temp_file.name, audio_segment, sample_rate)
+            
+            # 读取文件内容并转换为base64
+            with open(temp_file.name, 'rb') as f:
+                audio_bytes = f.read()
+                audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+            
+            # 删除临时文件
+            os.unlink(temp_file.name)
+            
+            return audio_base64
+            
+    except Exception as e:
+        print(f"Error extracting audio segment: {e}")
+        return None
 
 def generate_video_streaming(session_id, prompt, audio_path=None, image_path=None, use_conversation=True):
     """Generate video in pipelined streaming mode"""
@@ -218,13 +333,14 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
         active_sessions[session_id] = {
             'status': 'generating',
             'thread': threading.current_thread(),
-            'start_time': datetime.now()
+            'start_time': datetime.now(),
+            'audio_path': audio_path  # 保存音频路径用于后续音频片段提取
         }
 
         # Process audio conversation with Qwen-Omni if enabled and audio is provided
         final_audio_path = audio_path
         conversation_text = None
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         if use_conversation and audio_path and qwen_omni_talker:
             try:
                 # Send conversation processing status
@@ -241,7 +357,7 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
                     final_audio_path = reply_audio_path
                     conversation_text = reply_text
                     print(f"Using Qwen-Omni reply audio: {final_audio_path}")
-                    
+                    active_sessions[session_id]["reply_audio_path"] = reply_audio_path
                     # Send conversation completion status
                     socketio.emit('conversation_complete', {
                         'type': 'conversation_complete',
@@ -265,14 +381,17 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
                     'session_id': session_id,
                     'message': f'Conversation processing failed: {str(e)}, using original audio'
                 }, room=session_id)
-
+        audio_data, sample_rate = sf.read(reply_audio_path)
+        duration: float = audio_data.size / sample_rate
+        frames = int(duration * 16)
+        print(f"audio_data: {audio_data.size}, duration: {duration}, frames: {frames}")
         with torch.no_grad():
             # Use causal pipeline
             # if num_blocks is None:
             #     num_blocks = getattr(args, 'num_blocks', 7)
             # if frames_per_block is None:
             #     frames_per_block = getattr(args, 'num_frame_per_block', 3)
-            noise = torch.randn([1, 21, 16, 50, 90], device="cuda", dtype=torch.bfloat16)
+            noise = torch.randn([1, int(round(frames / 12, 0)) * 3, 16, 50, 90], device="cuda", dtype=torch.bfloat16)
             results = causal_model_pipeline(
                 noise=noise,
                 text_prompts=prompt,
