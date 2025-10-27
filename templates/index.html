@@ -484,7 +484,7 @@
         let audioBlob = null;
         let recordingStartTime = null;
         let imageFile = null;
-        let serverUrl = 'http://localhost:20143';
+        let serverUrl = window.location.origin;;
         let socket = null;
         let currentSessionId = null;
         let isGenerating = false;
@@ -874,7 +874,7 @@
                 audioQueue.push({
                     data: audioData,
                     startTime: data.audio_start_time || 0,
-                    duration: data.audio_duration || 0.04, // 默认40ms（25fps）
+                    duration: data.audio_duration || 0.0625, // 默认62.5ms（16fps）
                     frameNumber: data.frame_number || data.chunk_number
                 });
 
@@ -1180,13 +1180,15 @@
                     ctx.drawImage(img, 0, 0);
 
                     // 继续播放下一帧
-                    setTimeout(playNextFrame, 40); // 25fps
+                    // setTimeout(playNextFrame, 40); // 25fps
+                    setTimeout(playNextFrame, 1000 / 16);   // 16 fps
                 };
 
                 img.onerror = function() {
                     console.error('图像加载失败:', frameData);
                     // 继续播放下一帧
                     setTimeout(playNextFrame, 40);
+                    setTimeout(playNextFrame, 1000 / 16);
                 };
 
                 // 设置图像源
@@ -1570,7 +1572,7 @@
                 const startPromise = new Promise((resolve, reject) => {
                     const timeout = setTimeout(() => {
                         reject(new Error('Generation start timeout'));
-                    }, 10000);
+                    }, 20000);
 
                     socket.once('generation_started', (data) => {
                         clearTimeout(timeout);

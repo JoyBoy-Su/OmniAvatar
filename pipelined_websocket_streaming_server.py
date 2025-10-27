@@ -11,6 +11,7 @@ import torch
 import torch.multiprocessing as mp
 from flask import Flask, request
 from flask_cors import CORS
+from fastapi.middleware.cors import CORSMiddleware
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import numpy as np
 import soundfile as sf
@@ -718,7 +719,7 @@ def handle_switch_mode(data):
     
     print(f"Mode switched to: {'causal' if use_causal_mode else 'normal'}")
 
-@app.route('/health', methods=['GET'])
+@app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     global model_pipeline, causal_model_pipeline, use_causal_mode, qwen_omni_talker
@@ -735,7 +736,7 @@ def health_check():
         "active_sessions": len(active_sessions)
     }
 
-@app.route('/model_info', methods=['GET'])
+@app.route('/api/model_info', methods=['GET'])
 def model_info():
     """Get model information"""
     global args, use_causal_mode, qwen_omni_talker
