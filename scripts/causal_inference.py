@@ -1,6 +1,7 @@
 from tqdm import tqdm
 from typing import List, Optional, Dict, Any
 import os
+import time
 import torch
 import torch.nn as nn
 from OmniAvatar.utils.args_config import parse_args
@@ -401,6 +402,7 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.kv_cache1 is None:
             self.initialize_kv_cache(batch_size, dtype, device)
             self.initialize_crossattn_cache(batch_size, dtype, device)
+            self.comprehensive_warmup_kv_cache()
         else:
             self.reset_caches(device)
 
@@ -434,6 +436,101 @@ class CausalInferencePipeline(torch.nn.Module):
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
+
+    def comprehensive_warmup_kv_cache(self):
+        """全面预热KV cache，覆盖多个内存边界点以避免运行时延迟"""
+        if not hasattr(self, 'kv_cache1') or self.kv_cache1 is None:
+            return
+            
+        print("Starting comprehensive KV cache warmup...")
+        warmup_start_time = time.time()
+        
+        # 根据日志分析确定的关键内存边界点
+        kv_cache_size = self.kv_cache1[0]["k"].shape[1]
+        
+        # 定义多个预热范围，覆盖观察到的慢点
+        warmup_ranges = [
+            (0, min(1000, kv_cache_size)),           # 初始区域预热
+            (3000, min(4000, kv_cache_size)),        # 第一个边界 (3375附近)
+            (6500, min(7500, kv_cache_size)),        # 第二个边界 (6750附近) 
+            (9500, min(10500, kv_cache_size)),       # 第三个边界 (10125附近)
+            (15000, min(16000, kv_cache_size)),      # 更大的边界
+            (20000, min(21000, kv_cache_size)),      # 额外边界
+        ]
+        
+        # 过滤掉超出cache大小的范围
+        valid_ranges = [(start, end) for start, end in warmup_ranges if start < kv_cache_size]
+        
+        print(f"Warming up {len(valid_ranges)} memory boundary regions...")
+        
+        for i, (start_idx, end_idx) in enumerate(valid_ranges):
+            range_start_time = time.time()
+            size = end_idx - start_idx
+            
+            # 创建预热数据
+            dummy_k = torch.randn(1, size, self.kv_cache1[0]["k"].shape[2], 
+                                 dtype=self.kv_cache1[0]["k"].dtype, 
+                                 device=self.kv_cache1[0]["k"].device)
+            dummy_v = torch.randn(1, size, self.kv_cache1[0]["v"].shape[2],
+                                 dtype=self.kv_cache1[0]["v"].dtype, 
+                                 device=self.kv_cache1[0]["v"].device)
+            
+            # 预热所有transformer层的这个范围
+            for layer_idx, kv_cache in enumerate(self.kv_cache1):
+                # 先预热v，再预热k（模拟实际使用顺序）
+                kv_cache["v"][:, start_idx:end_idx] = dummy_v
+                kv_cache["k"][:, start_idx:end_idx] = dummy_k
+                
+                # 每几层同步一次，避免过度同步开销
+                if layer_idx % 5 == 0 or layer_idx == len(self.kv_cache1) - 1:
+                    torch.cuda.synchronize()
+            
+            range_time = time.time() - range_start_time
+            print(f"  Range [{start_idx}:{end_idx}] warmed up in {range_time:.4f}s")
+        
+        # 重置缓存状态，清除预热数据的影响
+        self.reset_caches(self.kv_cache1[0]["k"].device)
+        
+        total_warmup_time = time.time() - warmup_start_time
+        print(f"Comprehensive KV cache warmup completed in {total_warmup_time:.4f}s!")
+        
+        # 标记已预热，避免重复预热
+        self._kv_cache_warmed_up = True
+
+    def adaptive_warmup_before_inference(self, current_chunk_id: int = 0):
+        """在推理前进行自适应预热，针对特定chunk的内存访问模式"""
+        if hasattr(self, '_kv_cache_warmed_up') and self._kv_cache_warmed_up:
+            return  # 已经进行过全面预热
+            
+        print(f"Applying adaptive warmup for chunk {current_chunk_id}...")
+        
+        # 根据chunk预测可能的内存访问边界
+        # 基于观察：每个chunk大约使用3375个token的空间
+        chunk_size = 3375
+        predicted_boundaries = []
+        
+        for i in range(4):  # 预热接下来4个可能的边界
+            boundary = (current_chunk_id + i) * chunk_size
+            if boundary < self.kv_cache1[0]["k"].shape[1]:
+                # 在边界前后各预热一些空间
+                start = max(0, boundary - 200)
+                end = min(self.kv_cache1[0]["k"].shape[1], boundary + 200)
+                predicted_boundaries.append((start, end))
+        
+        # 执行预热
+        for start_idx, end_idx in predicted_boundaries:
+            size = end_idx - start_idx
+            dummy_k = torch.randn(1, size, self.kv_cache1[0]["k"].shape[2], 
+                                 dtype=self.kv_cache1[0]["k"].dtype, 
+                                 device=self.kv_cache1[0]["k"].device)
+            dummy_v = torch.randn_like(dummy_k)
+            
+            # 只预热第一层，减少开销
+            self.kv_cache1[0]["v"][:, start_idx:end_idx] = dummy_v
+            self.kv_cache1[0]["k"][:, start_idx:end_idx] = dummy_k
+            torch.cuda.synchronize()
+        
+        print(f"Adaptive warmup completed for {len(predicted_boundaries)} boundaries")
 
     def initialize_crossattn_cache(self, batch_size: int, dtype: torch.dtype, device: torch.device):
         """Initialize cross-attention cache."""

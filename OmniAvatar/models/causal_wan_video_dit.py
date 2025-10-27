@@ -9,6 +9,7 @@ import torch.distributed as dist
 from einops import rearrange
 from typing import Tuple, Optional
 from argparse import Namespace
+import time
 
 from .audio_pack import AudioPack
 from .wan_video_dit import (
@@ -146,18 +147,24 @@ class CausalSelfAttention(nn.Module):
             )
             x=x[:, :, :x.shape[2]-padded_length].transpose(2, 1).reshape(B, T, -1) #这里与源代码不同防止pad=0变成空切片
         else:
-            
+            self_attn_start = time.time()
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
-            
+            process_end = time.time()
+            print(f"[TIMING] self attn forward process: {process_end - self_attn_start:.6f}s")
+
             ##Freqs here are causal.
             roped_query = rope_apply(q, freqs,self.num_heads).type_as(v)
             roped_key = rope_apply(k, freqs,self.num_heads).type_as(v)
+            rope_end = time.time()
+            print(f"[TIMING] self attn forward rope apply: {rope_end - process_end:.6f}s")
+            
             
             current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
             # If we are using local attention and the current KV cache size is larger than the local attention size, we need to truncate the KV cache
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
+            update_kv_cache_start = time.time()
             if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                 # Calculate the number of new tokens added in this step
@@ -176,25 +183,53 @@ class CausalSelfAttention(nn.Module):
                 local_start_index = local_end_index - num_new_tokens
                 kv_cache["k"][:, local_start_index:local_end_index] = roped_key
                 kv_cache["v"][:, local_start_index:local_end_index] = v
+                update_kv_cache_end = time.time()
+                print(f"[TIMING] self attn forward update kv cache (if): {update_kv_cache_end - update_kv_cache_start:.6f}s")
             else:
                 # Assign new keys/values directly up to current_end
-                local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                # local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                local_end_index = kv_cache["local_end_index"] + current_end - kv_cache["global_end_index"]
+                # local_end_index = local_end_index.item()
+                # import pdb; pdb.set_trace()
+                end1 = time.time()
+                print(f"[TIMING] self attn forward update kv cache (else) time1: {end1 - update_kv_cache_start:.6f}s")
                 local_start_index = local_end_index - num_new_tokens
-                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                # local_start_index = local_start_index.item()
+                end2 = time.time()
+                print(f"[TIMING] self attn forward update kv cache (else) time2: {end2 - end1:.6f}s")
+    
+                # print(f"kv_cache_v: {kv_cache['v'].shape}, {kv_cache['v'].device}")
+                # print(f"v: {v.shape}, {v.device}")
                 kv_cache["v"][:, local_start_index:local_end_index] = v
+                end3 = time.time()
+                print(f"[TIMING] self attn forward update kv cache (else) time3: {end3 - end2:.6f}s")
+                # print(f"kv_cache_k: {kv_cache['k'].shape}, {kv_cache['k'].device}")
+                # print(f"roped_key: {roped_key.shape}, {roped_key.device}")
+                # print(f"local_start_index: {local_start_index}, local_end_index: {local_end_index}")
+                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                end4 = time.time()
+                print(f"[TIMING] self attn forward update kv cache (else) time4: {end4 - end3:.6f}s")
+                update_kv_cache_end = time.time()
+                print(f"[TIMING] self attn forward update kv cache (else): {update_kv_cache_end - update_kv_cache_start:.6f}s")
+            attn_start = time.time()
             x = self.attn(
                 roped_query,
                 kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
                 kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
             )
+            attn_end = time.time()
+            print(f"[TIMING] self attn forward attn: {attn_end - attn_start:.6f}s")
             kv_cache["global_end_index"].fill_(current_end)
-            kv_cache["local_end_index"].fill_(local_end_index)
-            
+            kv_cache["local_end_index"].fill_(local_end_index[0])
+            final_kv_cache_end = time.time()
+            print(f"[TIMING] self attn forward final kv cache: {final_kv_cache_end - attn_end:.6f}s")
+        
         #应该不需要flatten
         x = self.o(x)
+        output_end = time.time()
+        print(f"[TIMING] self attn forward output layer: {output_end - final_kv_cache_end:.6f}s")
         return x
-            
-    
+
     
 class CausalDiTBlock(nn.Module):
     def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6,local_attn_size=-1,sink_size=0):
@@ -219,19 +254,26 @@ class CausalDiTBlock(nn.Module):
         # msa: multi-head self-attention  mlp: multi-layer perceptron
          #Note: 这里 t_mod 拓展成（b,f,6,dim） 
         
-         
+        forward_start = time.time()
         num_frames,frame_seqlen=t_mod.shape[1],x.shape[1]//t_mod.shape[1]
          
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.unsqueeze(1).to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=2)
         
         input_x = modulate(self.norm1(x).unflatten(dim=1,sizes=(num_frames,frame_seqlen)), shift_msa, scale_msa).flatten(1,2)
+        process_end = time.time()
+        # print(f"[TIMING] block forward process: {process_end - forward_start:.6f}s")
         y=self.self_attn(input_x, freqs,grid_sizes=grid_sizes,block_mask=block_mask,kv_cache=kv_cache,current_start=current_start,cache_start=cache_start)
-        
+        self_attn_end = time.time()
+        print(f"[TIMING] block forward self attention: {self_attn_end - process_end:.6f}s")
         #x = self.gate(x, gate_msa,y.unflatten(dim=1,sizes=(num_frames,frame_seqlen)))
         x=x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate_msa).flatten(1, 2)
+        unflatten_end = time.time()
+        # print(f"[TIMING] block forward unflatten: {unflatten_end - self_attn_end:.6f}s")
         
         x = x + self.cross_attn(self.norm3(x), context,crossattn_cache)
+        cross_attn_end = time.time()
+        # print(f"[TIMING] block forward cross attention: {cross_attn_end - unflatten_end:.6f}s")
         
         input_x = modulate(self.norm2(x).unflatten(dim=1,sizes=(num_frames,frame_seqlen)), shift_mlp, scale_mlp).flatten(1,2)
         #x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -311,6 +353,13 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
             
         self.block_mask=None
         
+        # 添加频率缓存机制
+        self.freq_cache = {}
+        self.max_cache_size = 100  # 限制缓存大小
+        
+        # 预计算常用的频率组合以进一步优化
+        self._precompute_common_freqs()
+        
         self.num_frame_per_block=1
         
         self.independent_first_frame=False
@@ -364,7 +413,14 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
                 **kwargs,
                 ):
         
+        # ===== TIMING: Start of forward_train =====
+        start_time = time.time()
+        print(f"[TIMING] _forward_train started at {start_time:.6f}")
+        
         device = self.patch_embedding.weight.device
+        
+        # ===== TIMING: Block mask preparation =====
+        mask_start = time.time()
         
         # Construct blockwise causal attn mask
         if self.block_mask is None:
@@ -386,6 +442,11 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
                         local_attn_size=self.local_attn_size
                     )
         
+        mask_end = time.time()
+        print(f"[TIMING] Block mask preparation: {mask_end - mask_start:.6f}s")
+        
+        # ===== TIMING: Patch embedding =====
+        patch_start = time.time()
         
         lat_h, lat_w = x.shape[-2], x.shape[-1]
         x = torch.cat([x, y], dim=1)
@@ -393,7 +454,11 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
         x, (f, h, w) = self.patchify(x)
         grid_sizes = torch.tensor([f, h, w]).unsqueeze(0) 
         
+        patch_end = time.time()
+        print(f"[TIMING] Patch embedding: {patch_end - patch_start:.6f}s")
         
+        # ===== TIMING: Time embeddings =====
+        time_emb_start = time.time()
         
         #time embeddings
         #timestep.shape (B,F)
@@ -405,6 +470,11 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
         #context
         context = self.text_embedding(context)
         
+        time_emb_end = time.time()
+        print(f"[TIMING] Time & text embeddings: {time_emb_end - time_emb_start:.6f}s")
+        
+        # ===== TIMING: Audio processing =====
+        audio_start = time.time()
         
         if audio_emb != None and self.use_audio: # TODO  cache
             audio_emb = audio_emb.permute(0, 2, 1)[:, :, :, None, None]
@@ -413,6 +483,11 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
 
             audio_emb = torch.concat([audio_cond_proj(audio_emb) for audio_cond_proj in self.audio_cond_projs], 0)
         
+        audio_end = time.time()
+        print(f"[TIMING] Audio processing: {audio_end - audio_start:.6f}s")
+        
+        # ===== TIMING: Frequency preparation =====
+        freq_start = time.time()
         
         # arguments
         kwargs=dict(
@@ -425,6 +500,12 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        
+        freq_end = time.time()
+        print(f"[TIMING] Frequency preparation: {freq_end - freq_start:.6f}s")
+        
+        # ===== TIMING: Main transformer blocks =====
+        blocks_start = time.time()
         
         def create_custom_forward(module):
             def custom_forward(*inputs,**kwargs):
@@ -482,10 +563,22 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
                 else:
                     x = block(x, context, t_mod, freqs,**kwargs)
                     
+            blocks_end = time.time()
+            print(f"[TIMING] All transformer blocks: {blocks_end - blocks_start:.6f}s")
+            
+            # ===== TIMING: Cache operations =====
+            cache_start = time.time()
+            
             if tea_cache is not None:
                 x_cache = get_sp_group().all_gather(x, dim=1) # TODO: the size should be devided by sp_size
                 x_cache = x_cache[:, :ori_x_len]
                 tea_cache.store(x_cache)
+
+        cache_end = time.time()
+        print(f"[TIMING] Cache operations: {cache_end - cache_start:.6f}s")
+        
+        # ===== TIMING: Head and unpatchify =====
+        head_start = time.time()
 
         x = self.head(x, t.unflatten(dim=0,sizes=timestep.shape).unsqueeze(2))
         if args.sp_size > 1:
@@ -494,6 +587,15 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
             x = x[:, :ori_x_len]
         x=x.reshape(x.shape[0],-1,x.shape[-1])
         x = self.unpatchify(x, (f, h, w))
+        
+        head_end = time.time()
+        print(f"[TIMING] Head and unpatchify: {head_end - head_start:.6f}s")
+        
+        # ===== TIMING: Total forward_train time =====
+        total_end = time.time()
+        print(f"[TIMING] _forward_train TOTAL: {total_end - start_time:.6f}s")
+        print("=" * 60)
+        
         return x
     
     def _forward_inference(self,
@@ -514,7 +616,15 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
                 **kwargs,
                 ):
     
+        # ===== TIMING: Start of forward_inference =====
+        start_time = time.time()
+        print(f"[TIMING] _forward_inference started at {start_time:.6f}")
+        
         device = self.patch_embedding.weight.device
+        
+        # ===== TIMING: Patch embedding =====
+        patch_start = time.time()
+        
         lat_h, lat_w = x.shape[-2], x.shape[-1]
         x = torch.cat([x, y], dim=1)
         x = self.patch_embedding(x)
@@ -522,12 +632,21 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
         
         grid_sizes = torch.tensor([f, h, w]).unsqueeze(0)
         
+        patch_end = time.time()
+        # print(f"[TIMING] Patch embedding: {patch_end - patch_start:.6f}s")
+        
+        # ===== TIMING: Time embeddings =====
+        time_emb_start = time.time()
+        
         #time embeddings
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep.flatten()).type_as(x))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim)).unflatten(dim=0, sizes=timestep.shape)
         #context
         context = self.text_embedding(context)
+
+        time_emb_end = time.time()
+        # print(f"[TIMING] Time & text embeddings: {time_emb_end - time_emb_start:.6f}s")
 
         ##To trunk the audio_emb into each block,we will embedding audio_emd in pipeline
         '''
@@ -537,6 +656,10 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
             audio_emb = self.audio_proj(audio_emb)
             audio_emb = torch.concat([audio_cond_proj(audio_emb) for audio_cond_proj in self.audio_cond_projs], 0)
         '''
+        
+        # ===== TIMING: Frequency preparation =====
+        freq_start = time.time()
+        
         # arguments
         kwargs=dict(
             grid_sizes=grid_sizes,
@@ -551,12 +674,15 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
         ##causal rope
         frame_seqlen=math.prod(grid_sizes[0][1:]).item()
         current_start_frame = current_start // frame_seqlen
-        freqs = torch.cat([
-            self.freqs[0][current_start_frame:current_start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
         
+        # 使用缓存的频率计算
+        freqs = self._get_cached_freqs(f, h, w, current_start_frame, x.device)
+        
+        freq_end = time.time()
+        print(f"[TIMING] Frequency preparation: {freq_end - freq_start:.6f}s")
+        
+        # ===== TIMING: KV Cache operations =====
+        kv_cache_start = time.time()
         
         if tea_cache is not None:
             tea_cache_update = tea_cache.check(self, x, t_mod)
@@ -574,8 +700,15 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
                     pad_size = sp_size - ori_x_len % sp_size
                     x = torch.cat([x, torch.zeros_like(x[:, -1:]).repeat(1, pad_size, 1)], 1)
                 x = torch.chunk(x, sp_size, dim=1)[get_sequence_parallel_rank()]
+            kv_cache_end = time.time()
+            # print(f"[TIMING] KV Cache setup: {kv_cache_end - kv_cache_start:.6f}s")
+            
+            # ===== TIMING: Main transformer blocks =====
+            blocks_start = time.time()
+            
             audio_emb = audio_emb.reshape(x.shape[0], audio_emb.shape[0] // x.shape[0], -1, *audio_emb.shape[2:])
             for layer_i, block in enumerate(self.blocks):
+                layer_start = time.time()
                 # audio cond
                 if self.use_audio:
                     au_idx = None
@@ -589,7 +722,8 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
                             audio_cond_tmp = torch.chunk(audio_cond_tmp, sp_size, dim=1)[get_sequence_parallel_rank()]
                        
                         x = audio_cond_tmp + x
-
+                layer_audio_end = time.time()
+                print(f"[TIMING] Layer {layer_i} audio process: {layer_audio_end - layer_start:.6f}s")
                 if self.training and use_gradient_checkpointing:
                     if use_gradient_checkpointing_offload:
                         with torch.autograd.graph.save_on_cpu():
@@ -620,6 +754,7 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
                             use_reentrant=False,
                         )
                 else:
+                    layer_block_start = time.time()
                     kwargs.update(
                         {
                             "kv_cache": kv_cache[layer_i],
@@ -629,11 +764,25 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
                         }
                     )
                     x = block(x, context, t_mod, freqs,**kwargs)
+                    layer_block_end = time.time()
+                    print(f"[TIMING] Layer {layer_i} (with KV cache): {layer_block_end - layer_block_start:.6f}s")
                     
+            blocks_end = time.time()
+            print(f"[TIMING] All transformer blocks (with KV cache): {blocks_end - blocks_start:.6f}s")
+            
+            # ===== TIMING: Cache operations =====
+            cache_start = time.time()
+            
             if tea_cache is not None:
                 x_cache = get_sp_group().all_gather(x, dim=1) # TODO: the size should be devided by sp_size
                 x_cache = x_cache[:, :ori_x_len]
                 tea_cache.store(x_cache)
+
+        cache_end = time.time()
+        # print(f"[TIMING] Cache operations: {cache_end - cache_start:.6f}s")
+        
+        # ===== TIMING: Head and unpatchify =====
+        head_start = time.time()
 
         x = self.head(x, t.unflatten(dim=0,sizes=timestep.shape).unsqueeze(2))
         if args.sp_size > 1:
@@ -643,7 +792,79 @@ class CausalWanModel(torch.nn.Module): #note:目前训练分支传参等还需�
         x=x.reshape(x.shape[0],-1,x.shape[-1])
         x = self.unpatchify(x, (f, h, w))
         
+        head_end = time.time()
+        # print(f"[TIMING] Head and unpatchify: {head_end - head_start:.6f}s")
+        
+        # ===== TIMING: Total forward_inference time =====
+        total_end = time.time()
+        print(f"[TIMING] _forward_inference TOTAL: {total_end - start_time:.6f}s")
+        print("=" * 60)
+        
         return x
+    
+    def _get_cached_freqs(self, f, h, w, current_start_frame, device):
+        """获取缓存的频率张量，避免重复计算"""
+        cache_key = (f, h, w, current_start_frame, str(device))
+        
+        # 首先检查设备特定的缓存
+        if cache_key in self.freq_cache:
+            return self.freq_cache[cache_key]
+        
+        # 检查是否有预计算的CPU版本
+        cpu_cache_key = (f, h, w, current_start_frame, 'cpu')
+        if cpu_cache_key in self.freq_cache:
+            # 将预计算的CPU张量转移到目标设备
+            freqs = self.freq_cache[cpu_cache_key].to(device)
+            self.freq_cache[cache_key] = freqs
+            return freqs
+        
+        # 如果没有缓存，进行计算
+        # 使用torch.no_grad()减少内存开销
+        with torch.no_grad():
+            freqs = torch.cat([
+                self.freqs[0][current_start_frame:current_start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(device)
+        
+        # 缓存管理：如果缓存太大，清理最旧的条目
+        if len(self.freq_cache) >= self.max_cache_size:
+            # 简单的FIFO策略，删除第一个条目
+            oldest_key = next(iter(self.freq_cache))
+            del self.freq_cache[oldest_key]
+        
+        self.freq_cache[cache_key] = freqs
+        return freqs
+    
+    def _precompute_common_freqs(self):
+        """预计算常用的频率组合"""
+        # 常见的视频尺寸组合
+        common_configs = [
+            (1, 32, 32),   # 小尺寸
+            (1, 45, 25),   # 中等尺寸  
+            (4, 32, 32),   # 多帧小尺寸
+            (4, 45, 25),   # 多帧中等尺寸
+        ]
+        
+        # 预计算前几帧的频率
+        for f, h, w in common_configs:
+            for start_frame in range(min(10, len(self.freqs[0]))):  # 预计算前10帧
+                try:
+                    if start_frame + f <= len(self.freqs[0]):
+                        # 使用CPU进行预计算，避免GPU内存问题
+                        freqs = torch.cat([
+                            self.freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+                        ], dim=-1).reshape(f * h * w, 1, -1)
+                        
+                        # 存储到缓存中（CPU版本，使用时再转移到GPU）
+                        cache_key = (f, h, w, start_frame, 'cpu')
+                        self.freq_cache[cache_key] = freqs
+                except Exception:
+                    # 如果预计算失败，跳过这个配置
+                    continue
+    
     #crate mask.
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(

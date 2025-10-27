@@ -33,7 +33,16 @@ from OmniAvatar.utils.io_utils import save_video_as_grid_and_mp4
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 app.config['SECRET_KEY'] = 'omniavatar-pipelined-streaming'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# Increase max_http_buffer_size to handle large base64 images (default is 1MB)
+# engineio_logger=True will show debug info
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='threading',
+    max_http_buffer_size=100*1024*1024,
+    ping_timeout=60,
+    ping_interval=25
+)
 
 # Global variables
 model_pipeline = None
@@ -56,24 +65,33 @@ class QwenOmniTalker:
             "content": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.",
         }
         
-    def process_audio_conversation(self, audio_path, session_id=None):
+    def process_audio_conversation(self, audio_path, session_id=None, prompt="Analyze this audio and respond naturally."):
         """
         处理音频对话，返回回复的音频文件路径
-        
+
         Args:
             audio_path: 输入音频文件路径
             session_id: 会话ID，用于生成唯一的输出文件名
-            
+            prompt: 文本提示词，默认为分析音频内容
+
         Returns:
             tuple: (reply_audio_path, reply_text) 回复音频路径和文本内容
         """
         try:
-            # 构建消息
+            # 读取音频文件并编码为base64
+            with open(audio_path, 'rb') as audio_file:
+                audio_bytes = audio_file.read()
+                audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+
+            # 构建消息 - 使用input_audio格式发送音频输入
             messages = [
-                # self.system_message,
+                self.system_message,
                 {
                     "role": "user",
-                    "content": "你是谁？一句话回答我，不要超过20字。"
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "input_audio", "input_audio": {"data": f"data:;base64,{audio_base64}", "format": "wav"}},
+                    ],
                 },
             ]
             
@@ -381,7 +399,7 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
                     'session_id': session_id,
                     'message': f'Conversation processing failed: {str(e)}, using original audio'
                 }, room=session_id)
-        audio_data, sample_rate = sf.read(reply_audio_path)
+        audio_data, sample_rate = sf.read(final_audio_path)
         duration: float = audio_data.size / sample_rate
         frames = int(duration * 16)
         print(f"audio_data: {audio_data.size}, duration: {duration}, frames: {frames}")
@@ -524,7 +542,7 @@ def handle_generate_streaming_base64(data):
     """Handle pipelined streaming video generation request with base64 data"""
     global model_pipeline, causal_model_pipeline, use_causal_mode
 
-    # print(f"data: {data}")
+    print(f"[DEBUG] Received generate_streaming_base64 request")
     current_pipeline = causal_model_pipeline if use_causal_mode else model_pipeline
     if current_pipeline is None:
         mode_str = "causal " if use_causal_mode else ""
@@ -538,6 +556,7 @@ def handle_generate_streaming_base64(data):
             prompt = 'A person speaking naturally with lip sync to the audio'
 
         audio_base64 = data.get('audio_base64')
+        audio_mime_type = data.get('audio_mime_type', 'audio/wav')  # Get MIME type from frontend
         image_base64 = data.get('image_base64')
         height = data.get('height', 720)
         width = data.get('width', 720)
@@ -545,11 +564,11 @@ def handle_generate_streaming_base64(data):
         guidance_scale = data.get('guidance_scale', args.guidance_scale)
         audio_scale = data.get('audio_scale', args.audio_scale)
         negative_prompt = data.get('negative_prompt', args.negative_prompt)
-        
+
         # Causal-specific parameters
         num_blocks = data.get('num_blocks', getattr(args, 'num_blocks', 7))
         frames_per_block = data.get('frames_per_block', getattr(args, 'num_frame_per_block', 3))
-        
+
         # Conversation parameters
         use_conversation = data.get('use_conversation', True)  # Enable conversation by default
         
@@ -567,11 +586,50 @@ def handle_generate_streaming_base64(data):
             # Handle audio file
             if audio_base64:
                 audio_data = base64.b64decode(audio_base64)
-                audio_temp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+
+                # Determine file extension from MIME type
+                extension_map = {
+                    'audio/wav': '.wav',
+                    'audio/webm': '.webm',
+                    'audio/webm;codecs=opus': '.webm',
+                    'audio/ogg': '.ogg',
+                    'audio/mp3': '.mp3',
+                    'audio/mpeg': '.mp3',
+                    'audio/mp4': '.mp4',
+                    'audio/m4a': '.m4a'
+                }
+                file_ext = extension_map.get(audio_mime_type, '.webm')
+
+                # Save the audio file with correct extension
+                audio_temp = tempfile.NamedTemporaryFile(suffix=file_ext, delete=False)
                 audio_temp.write(audio_data)
                 audio_temp.close()
-                audio_path = audio_temp.name
-                temp_files.append(audio_path)
+                audio_path_original = audio_temp.name
+                temp_files.append(audio_path_original)
+
+                # Convert to WAV if needed (for better compatibility with librosa/soundfile)
+                if file_ext != '.wav':
+                    try:
+                        import ffmpeg
+                        audio_path_wav = audio_path_original.replace(file_ext, '.wav')
+                        print(f"Converting {file_ext} to WAV: {audio_path_original} -> {audio_path_wav}")
+
+                        # Convert to WAV using ffmpeg
+                        stream = ffmpeg.input(audio_path_original)
+                        stream = ffmpeg.output(stream, audio_path_wav, acodec='pcm_s16le', ar='16000', ac=1)
+                        ffmpeg.run(stream, overwrite_output=True, quiet=True)
+
+                        audio_path = audio_path_wav
+                        temp_files.append(audio_path_wav)
+                        print(f"Audio converted successfully to WAV")
+                    except Exception as e:
+                        print(f"Warning: Failed to convert audio to WAV: {e}")
+                        print(f"Using original format {file_ext}, librosa should handle it")
+                        audio_path = audio_path_original
+                else:
+                    audio_path = audio_path_original
+
+                print(f"Audio file saved: {audio_path}, original format: {audio_mime_type}")
 
             # Handle image file
             if image_base64:
@@ -715,7 +773,7 @@ def main():
     
 
     initialize_model(causal_mode=True)
-    port = 20143
+    port = 20143  # Changed from 20144 to avoid conflict
     print(f"Starting Flask-SocketIO server on port {port}...")
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
 

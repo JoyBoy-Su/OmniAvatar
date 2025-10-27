@@ -40,3 +40,7 @@ frame_seq_length: 1125
 num_frame_per_block: 3
 independent_first_frame: False
 use_audio: True
+
+model_config:
+  local_attn_size: 30  # Enable KV cache eviction for 30 frames of history
+  sink_size: 0         # Number of initial frames to keep permanently in cache

@@ -35,3 +35,8 @@ negative_prompt: "Vivid color tones, background/camera moving quickly, screen sw
 silence_duration_s: 0.3
 use_fsdp: False
 tea_cache_l1_thresh: 0 # 0.14 The larger this value is, the faster the speed, but the worse the visual quality. TODO check value
+
+# Model architecture parameters - fixes KV cache overflow for videos >21 frames
+model_config:
+  local_attn_size: 30  # Enable KV cache eviction for 30 frames of history
+  sink_size: 0         # Number of initial frames to keep permanently in cache

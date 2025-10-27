@@ -82,6 +82,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
         self.denoising_thread = None
         self.vae_thread = None
         self.result_lock = threading.Lock()
+        self.stop_workers = threading.Event()  # Signal to stop worker threads
         # 事件触发同步机制
         self.denoising_events = deque()
         self.vae_events = deque()
@@ -145,6 +146,17 @@ class PipelinedCausalInferencePipeline(nn.Module):
             session_id: Session ID
             return_latents: Whether to return latents
         """
+        # Stop old worker threads if they exist
+        if self.denoising_thread is not None or self.vae_thread is not None:
+            print("Stopping old worker threads...")
+            self.stop_workers.set()
+            if self.denoising_thread is not None and self.denoising_thread.is_alive():
+                self.denoising_thread.join(timeout=2.0)
+            if self.vae_thread is not None and self.vae_thread.is_alive():
+                self.vae_thread.join(timeout=2.0)
+            self.stop_workers.clear()
+            print("Old worker threads stopped")
+
         # clear pipeline state
         self.current_clock = 0
         self.denoising_queue.queue.clear()
@@ -200,6 +212,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 self.vae_events[self.current_clock - 1].wait()
             # send current chunk, TODO: update interface
             total_frames_generated = self._send_chunk_frames(self.current_clock - 1, streaming_callback, session_id, total_frames_generated, num_blocks)
+            # import pdb; pdb.set_trace()
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
             self.current_clock += 1
@@ -210,6 +223,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
         
         # 打印性能统计报告
         self._print_timing_report()
+        # TODO: clear clock
   
     def _record_timing(self, step_name: str, duration: float, chunk_id: int = None):
         """记录步骤耗时"""
@@ -316,6 +330,9 @@ class PipelinedCausalInferencePipeline(nn.Module):
         Returns:
             Generated video tensor [batch_size, num_frames, channels, height, width]
         """
+        # Calculate required number of frames from noise tensor
+        batch_size, num_frames, num_channels, height, width = noise.shape
+
         # prepare image condition
         if image_path is not None:
             start_time = time.time()
@@ -332,7 +349,8 @@ class PipelinedCausalInferencePipeline(nn.Module):
             
             start_time = time.time()
             self.causal_pipe.vae.to("cuda:1")
-            img_lat = self.causal_pipe.vae.encode(videos=image.to(dtype=self.dtype),device="cuda:1").repeat(1,1,21,1,1)
+            # Use num_frames from noise tensor instead of hardcoded 21
+            img_lat = self.causal_pipe.vae.encode(videos=image.to(dtype=self.dtype),device="cuda:1").repeat(1,1,num_frames,1,1)
             msk = torch.zeros_like(img_lat)[:,:1]
             msk[:, :, 1:] = 1
             img_lat = torch.cat([img_lat, msk], dim=1)
@@ -506,8 +524,12 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 total_denoising_time = time.time() - denoising_start_time
                 self._record_timing("denoising_total", total_denoising_time, chunk_id)
                 
-                # Trigger denoising event
-                self.denoising_events[self.current_clock].set()
+                # 记录整个denoising任务的总时间
+                total_denoising_time = time.time() - denoising_start_time
+                self._record_timing("denoising_total", total_denoising_time, chunk_id)
+
+                # Trigger denoising event - use chunk_id instead of self.current_clock to avoid race condition
+                self.denoising_events[chunk_id].set()
                 
                 # Create VAE event for this block
                 self.vae_events.append(threading.Event())
@@ -519,15 +541,24 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 #         "latents": output[:, current_start_frame - 1:current_start_frame + current_num_frames].clone()
                 #     })
                 # else:
+                if current_start_frame > 0:
+                    latents = output[:, current_start_frame-1:current_start_frame + current_num_frames]
+                else:
+                    latents = output[:, current_start_frame:current_start_frame + current_num_frames]
+                print(f"chunk_id: {chunk_id}, latents: {latents.shape}")
                 task.update({
-                    "latents": denoised_pred.clone()
+                    "latents": latents.clone()
                 })
                 self.vae_queue.put(task)
                 
                 print(f"Causal denoising inference completed for block {chunk_id}")
                 self.denoising_queue.task_done()
-                
+
             except queue.Empty:
+                # Check if we should stop
+                if self.stop_workers.is_set():
+                    print("Denoising worker received stop signal")
+                    break
                 pass
             except Exception as e:
                 print(f"Error in causal denoising inference for block {chunk_id}: {e}")
@@ -568,6 +599,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 # video = video[:, :, 1:].permute(0, 2, 1, 3, 4)
                 # video = video[:, :, 1:]
                 # Ensure video is in float32 for compatibility with numpy conversion
+                video = video[:, 1:]
                 print(f"Video before float conversion - dtype: {video.dtype}, shape: {video.shape}")
                 video = (video.float() + 1) / 2  # Normalize from [-1, 1] to [0, 1]
                 print(f"Video after float conversion - dtype: {video.dtype}, shape: {video.shape}")
@@ -587,10 +619,14 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 self._record_timing("vae_total", total_vae_time, chunk_id)
                 
                 print(f"Video formatting completed for block {chunk_id}")
-                # trigger vae event
-                self.vae_events[self.current_clock - 1].set()
+                # trigger vae event - use chunk_id instead of self.current_clock - 1 to avoid race condition
+                self.vae_events[chunk_id].set()
                 self.vae_queue.task_done()
             except queue.Empty:
+                # Check if we should stop
+                if self.stop_workers.is_set():
+                    print("VAE worker received stop signal")
+                    break
                 pass
             except Exception as e:
                 print(f"Error in video formatting for block {chunk_id}: {e}")
@@ -602,7 +638,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
             return 0
         """Send frames for a completed block using frame-by-frame method"""
         print(f"Sending block {chunk_id} frames")
-        
+        # import pdb; pdb.set_trace()
         # 记录发送帧的开始时间
         send_start_time = time.time()
         
@@ -639,8 +675,10 @@ class PipelinedCausalInferencePipeline(nn.Module):
         # 记录整个发送过程的总时间
         total_send_time = time.time() - send_start_time
         self._record_timing("send_total", total_send_time, chunk_id)
+        print(f"total_frames_generated: {total_frames_generated}")
         
-        return total_frames_generated + video.shape[1]
+        # return total_frames_generated + video.shape[1]
+        return total_frames_generated
 
     def _send_frames_fallback(self, video, chunk_id, streaming_callback, session_id, total_frames_generated, total_blocks):
         """Frame-by-frame sending method (following pipelined_inference.py pattern)"""
@@ -673,7 +711,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
             
             # 回调发送时间
             callback_start_time = time.time()
-            import pdb; pdb.set_trace()
+            # import pdb; pdb.set_trace()
             streaming_callback({
                 "type": "video_frame",
                 "session_id": session_id,
