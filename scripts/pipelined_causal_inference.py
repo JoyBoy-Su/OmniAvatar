@@ -10,6 +10,7 @@ import tempfile
 import traceback
 import librosa
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import asyncio
 import threading
@@ -184,7 +185,9 @@ class PipelinedCausalInferencePipeline(nn.Module):
         # Step 3: temporal denoising loop
         print(f"NUM BLOCKS is {num_blocks}")
         all_num_frames = [self.args.num_frame_per_block] * num_blocks
+        executor = ThreadPoolExecutor(max_workers=2)
         total_frames_generated = 0
+        send_future = None
         for current_num_frames in all_num_frames:
             print(f"===================== Current clock: {self.current_clock} ======================")
             print(f"Processing frame {current_start_frame - num_input_frames} to {current_start_frame + current_num_frames - num_input_frames}.")
@@ -211,13 +214,29 @@ class PipelinedCausalInferencePipeline(nn.Module):
             if self.current_clock >= 1:
                 self.vae_events[self.current_clock - 1].wait()
             # send current chunk, TODO: update interface
-            total_frames_generated = self._send_chunk_frames(self.current_clock - 1, streaming_callback, session_id, total_frames_generated, num_blocks)
+            if send_future is not None:
+                print("Waiting previous send task...")
+                total_frames_generated = send_future.result()
+                send_future = None
+            send_future = executor.submit(
+                self._send_chunk_frames,
+                self.current_clock - 1,
+                streaming_callback,
+                session_id,
+                total_frames_generated,
+                num_blocks
+            )
+            # total_frames_generated = self._send_chunk_frames(self.current_clock - 1, streaming_callback, session_id, total_frames_generated, num_blocks)
             # import pdb; pdb.set_trace()
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
             self.current_clock += 1
         # TODO: wait decoding the last chunk?
         self.vae_events[self.current_clock - 1].wait()
+        if send_future is not None:
+            print("Waiting previous send task...")
+            total_frames_generated = send_future.result()
+            send_future = None
         # send the last chunk, TODO: update interface
         total_frames_generated = self._send_chunk_frames(self.current_clock - 1, streaming_callback, session_id, total_frames_generated, num_blocks)
         
@@ -242,6 +261,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
             forward_steps = {}
             denoising_steps = {}
             vae_steps = {}
+            send_steps = {}
             
             for key, times in self.timing_stats.items():
                 if key.startswith('forward_'):
@@ -250,6 +270,8 @@ class PipelinedCausalInferencePipeline(nn.Module):
                     denoising_steps[key] = times
                 elif 'vae' in key or 'decode' in key:
                     vae_steps[key] = times
+                elif 'send' in key:
+                    send_steps[key] = times
             
             # 打印Forward阶段统计
             if forward_steps:
@@ -286,6 +308,17 @@ class PipelinedCausalInferencePipeline(nn.Module):
                     total_vae_time += total_time
                     print(f"  {step:<35}: {avg_time:>8.3f}s (total: {total_time:>8.3f}s, count: {len(times)})")
                 print(f"  {'TOTAL VAE TIME':<35}: {total_vae_time:>8.3f}s")
+
+            if send_steps:
+                print("\n📤 SEND PHASE TIMING:")
+                print("-" * 50)
+                total_send_time = 0
+                for step, times in send_steps.items():
+                    avg_time = np.mean(times)
+                    total_time = np.sum(times)
+                    total_send_time += total_time
+                    print(f"  {step:<35}: {avg_time:>8.3f}s (total: {total_time:>8.3f}s, count: {len(times)})")
+                print(f"  {'TOTAL SEND TIME':<35}: {total_send_time:>8.3f}s")
             
             # 打印总体统计
             print("\n📈 OVERALL STATISTICS:")
@@ -590,7 +623,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 
                 # VAE解码阶段
                 decode_start_time = time.time()
-                video = self.causal_pipe.vae.decode(latents, device="cuda:1").permute(0, 2, 1, 3, 4)
+                video = self.causal_pipe.vae.decode(latents, device="cuda:1", tiled=False, tile_size=(30, 52), tile_stride=(15, 26)).permute(0, 2, 1, 3, 4)
                 decode_time = time.time() - decode_start_time
                 self._record_timing("vae_decode", decode_time, chunk_id)
                 
