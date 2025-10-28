@@ -398,14 +398,14 @@ class PipelinedCausalInferencePipeline(nn.Module):
             audio, sr = librosa.load(audio_path, sr=self.args.sample_rate)
         
             # Trim audio to 5 seconds
-            max_duration = 5.0  # 5 seconds
-            max_samples = int(max_duration * sr)
-            if len(audio) > max_samples:
-                audio = audio[:max_samples]
-                print(f"Audio trimmed to {max_duration} seconds")
+            # max_duration = 5.0  # 5 seconds
+            # max_samples = int(max_duration * sr)
+            # if len(audio) > max_samples:
+            #     audio = audio[:max_samples]
+            #     print(f"Audio trimmed to {max_duration} seconds")
             
             input_values = np.squeeze(
-                    self.causal_pipe.wav_feature_extractor(audio, sampling_rate=16000).input_values
+                    self.causal_pipe.wav_feature_extractor(audio, sampling_rate=16000).input_values # TODO: update sample rate to sr
                 )
             input_values = torch.from_numpy(input_values).float().to(device=self.device)
             audio_len = (noise.shape[1] - 1) * 4 + 1

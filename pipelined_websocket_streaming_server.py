@@ -146,7 +146,7 @@ class QwenOmniTalker:
                 os.makedirs(os.path.dirname(reply_audio_path), exist_ok=True)
                 
                 # 保存音频文件
-                sf.write(reply_audio_path, wav_array, samplerate=24000)
+                sf.write(reply_audio_path, wav_array, samplerate=16000)
                 print(f"Qwen-Omni reply audio saved to: {reply_audio_path}")
                 
                 return reply_audio_path, reply_text

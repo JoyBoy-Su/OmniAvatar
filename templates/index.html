@@ -897,7 +897,7 @@
         // 新增：初始化音频上下文
         function initializeAudioContext() {
             try {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 16000});
 
                 // 创建音量控制节点
                 audioGainNode = audioContext.createGain();
