@@ -552,7 +552,7 @@ class VideoVAE_(nn.Module):
 
     def decode(self, z, scale):
         # import pdb; pdb.set_trace()
-        self.clear_cache()
+        # self.clear_cache()
         # z: [b,c,t,h,w]
         if isinstance(scale[0], torch.Tensor):
             scale = [s.to(dtype=z.dtype, device=z.device) for s in scale]
@@ -789,6 +789,9 @@ class WanVideoVAE(nn.Module):
             videos.append(video)
         videos = torch.stack(videos)
         return videos
+
+    def clear_cache(self):
+        self.model.clear_cache()
 
 
     @staticmethod

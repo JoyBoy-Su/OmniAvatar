@@ -897,7 +897,7 @@
         // 新增：初始化音频上下文
         function initializeAudioContext() {
             try {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 24000});
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
                 // 创建音量控制节点
                 audioGainNode = audioContext.createGain();
@@ -1652,7 +1652,7 @@
 
         async function checkServerHealth() {
             try {
-                const response = await fetch(`${serverUrl}/health`);
+                const response = await fetch(`${serverUrl}/api/health`);
                 if (response.ok) {
                     console.log('服务器连接正常');
                 } else {

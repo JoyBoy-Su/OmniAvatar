@@ -130,9 +130,9 @@ class PipelinedCausalInferencePipeline(nn.Module):
             conditional_dict: dict,
             img_lat: torch.Tensor,
             output: torch.Tensor,
+            audio_path: str,
             streaming_callback,
-            session_id,
-            return_latents=False
+            session_id
         ):
         """
         Run pipelined causal inference
@@ -242,7 +242,8 @@ class PipelinedCausalInferencePipeline(nn.Module):
         
         # 打印性能统计报告
         self._print_timing_report()
-        # TODO: clear clock
+        # 保存完整视频并合并音频
+        self._save_complete_video_with_audio(num_blocks, audio_path, session_id)
   
     def _record_timing(self, step_name: str, duration: float, chunk_id: int = None):
         """记录步骤耗时"""
@@ -440,6 +441,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
         # text conditioning
         start_time = time.time()
         self.causal_pipe.text_encoder.to("cuda")
+        self.causal_pipe.vae.clear_cache()
         conditional_dict = self.causal_pipe.encode_text_prompts(text_prompts, positive=True)
         conditional_dict["image"] = img_lat
         conditional_dict["audio"] = audio_emb
@@ -467,9 +469,9 @@ class PipelinedCausalInferencePipeline(nn.Module):
             conditional_dict=conditional_dict,
             img_lat=img_lat,
             output=output,
+            audio_path=audio_path,
             streaming_callback=streaming_callback,
-            session_id=session_id,
-            return_latents=return_latents
+            session_id=session_id
         )
     
     @torch.no_grad()
@@ -494,7 +496,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 noisy_input = task["noisy_input"]
                 block_conditional_dict = task["block_conditional_dict"]
                 output = task["output"]
-                
+                # import pdb; pdb.set_trace()
                 # Step 3.1: Spatial denoising loop
                 denoising_loop_start = time.time()
                 for index, current_timestep in enumerate(self.causal_pipe.denoising_step_list):
@@ -574,10 +576,10 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 #         "latents": output[:, current_start_frame - 1:current_start_frame + current_num_frames].clone()
                 #     })
                 # else:
-                if current_start_frame > 0:
-                    latents = output[:, current_start_frame-1:current_start_frame + current_num_frames]
-                else:
-                    latents = output[:, current_start_frame:current_start_frame + current_num_frames]
+                # if current_start_frame > 0:
+                #     latents = output[:, current_start_frame-1:current_start_frame + current_num_frames]
+                # else:
+                latents = output[:, current_start_frame:current_start_frame + current_num_frames]
                 print(f"chunk_id: {chunk_id}, latents: {latents.shape}")
                 task.update({
                     "latents": latents.clone()
@@ -632,7 +634,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 # video = video[:, :, 1:].permute(0, 2, 1, 3, 4)
                 # video = video[:, :, 1:]
                 # Ensure video is in float32 for compatibility with numpy conversion
-                video = video[:, 1:]
+                # video = video[:, 1:]
                 print(f"Video before float conversion - dtype: {video.dtype}, shape: {video.shape}")
                 video = (video.float() + 1) / 2  # Normalize from [-1, 1] to [0, 1]
                 print(f"Video after float conversion - dtype: {video.dtype}, shape: {video.shape}")
@@ -727,13 +729,14 @@ class PipelinedCausalInferencePipeline(nn.Module):
             frame_data = video[:, frame_idx]
             # Convert to base64 (same as pipelined_inference.py)
             # First convert bfloat16 to float32, then to numpy
-            print(f"Frame {frame_idx} data type: {frame_data.dtype}, shape: {frame_data.shape}")
+            # print(f"Frame {frame_idx} data type: {frame_data.dtype}, shape: {frame_data.shape}")
             
             # 图像转换时间
             convert_start_time = time.time()
             frame_np = (frame_data.squeeze(0).permute(1, 2, 0).cpu().float().numpy() * 255).astype('uint8')
             frame_pil = Image.fromarray(frame_np)
-            # frame_pil.save(f"examples/frame_{frame_idx}.png")
+            # os.makedirs(f"examples/chunk_id_{chunk_id}", exist_ok=True)
+            # frame_pil.save(f"examples/chunk_id_{chunk_id}/frame_{frame_idx}.png")
             buffer = io.BytesIO()
             frame_pil.save(buffer, format='JPEG', quality=85)
             frame_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
@@ -788,3 +791,134 @@ class PipelinedCausalInferencePipeline(nn.Module):
         })
         
         return total_frames_generated
+
+    def _save_complete_video_with_audio(self, num_blocks: int, audio_path: Optional[str], session_id: Optional[str]):
+        """
+        保存完整视频并与音频合并
+        
+        Args:
+            num_blocks: 总的块数
+            audio_path: 音频文件路径（可选）
+            session_id: 会话ID（用于文件命名）
+        """
+        print("\n" + "="*80)
+        print("SAVING COMPLETE VIDEO WITH AUDIO")
+        print("="*80)
+        
+        save_start_time = time.time()
+        
+        # 步骤1: 从result_buffer收集所有视频块
+        print(f"收集 {num_blocks} 个视频块...")
+        all_videos = []
+        for chunk_id in range(num_blocks):
+            if chunk_id not in self.result_buffer:
+                print(f"警告: chunk {chunk_id} 不在 result_buffer 中")
+                continue
+            
+            video_chunk = self.result_buffer[chunk_id]["video"]
+            all_videos.append(video_chunk)
+            print(f"  Chunk {chunk_id}: shape {video_chunk.shape}")
+        
+        if len(all_videos) == 0:
+            print("错误: 没有找到任何视频块!")
+            return
+        
+        # 步骤2: 拼接所有视频块
+        print(f"拼接 {len(all_videos)} 个视频块...")
+        complete_video = torch.cat(all_videos, dim=1)  # 在时间维度拼接
+        print(f"完整视频 shape: {complete_video.shape}")
+        
+        # 步骤3: 转换为numpy数组
+        print("将视频转换为 numpy 数组...")
+        # Shape: (batch, time, channels, height, width) -> (time, height, width, channels)
+        video_np = complete_video.squeeze(0).permute(0, 2, 3, 1).cpu().float().numpy()
+        video_np = (video_np * 255).astype(np.uint8)
+        print(f"视频 numpy shape: {video_np.shape}")
+        
+        # 步骤4: 创建输出目录
+        output_dir = "output_videos"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 步骤5: 生成输出文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_str = f"_{session_id}" if session_id else ""
+        video_no_audio_path = os.path.join(output_dir, f"video_no_audio{session_str}_{timestamp}.mp4")
+        video_with_audio_path = os.path.join(output_dir, f"video_with_audio{session_str}_{timestamp}.mp4")
+        
+        # 步骤6: 保存无音频视频
+        print(f"保存无音频视频到: {video_no_audio_path}")
+        fps = getattr(self.args, 'fps', 16)
+        height, width = video_np.shape[1:3]
+        
+        # 使用cv2保存视频
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(video_no_audio_path, fourcc, fps, (width, height))
+        
+        for frame_idx in range(video_np.shape[0]):
+            frame_bgr = cv2.cvtColor(video_np[frame_idx], cv2.COLOR_RGB2BGR)
+            video_writer.write(frame_bgr)
+        
+        video_writer.release()
+        video_save_time = time.time() - save_start_time
+        print(f"✓ 无音频视频保存成功 (用时 {video_save_time:.2f}s)")
+        
+        # 步骤7: 如果有音频路径，使用ffmpeg合并音频
+        if audio_path is not None and os.path.exists(audio_path):
+            print(f"\n使用 ffmpeg 合并音频: {audio_path}")
+            merge_start_time = time.time()
+            
+            try:
+                # 构建ffmpeg命令
+                ffmpeg_cmd = [
+                    'ffmpeg',
+                    '-i', video_no_audio_path,  # 输入视频
+                    '-i', audio_path,            # 输入音频
+                    '-map', '0:v',               # 选择第一个输入的视频流
+                    '-map', '1:a',               # 选择第二个输入的音频流
+                    '-c:v', 'libx264',           # 视频编码器
+                    '-preset', 'medium',         # 编码预设
+                    '-crf', '23',                # 质量参数
+                    '-c:a', 'aac',               # 音频编码器
+                    '-b:a', '192k',              # 音频比特率
+                    '-shortest',                 # 以最短的流为准
+                    '-y',                        # 覆盖已存在的文件
+                    video_with_audio_path
+                ]
+                
+                print(f"执行命令: {' '.join(ffmpeg_cmd)}")
+                result = subprocess.run(
+                    ffmpeg_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5分钟超时
+                )
+                
+                if result.returncode == 0:
+                    merge_time = time.time() - merge_start_time
+                    print(f"✓ 音画合并视频保存成功: {video_with_audio_path}")
+                    print(f"  音频合并用时: {merge_time:.2f}s")
+                else:
+                    print(f"✗ ffmpeg 错误 (返回码: {result.returncode})")
+                    print(f"  stderr: {result.stderr}")
+                    print(f"  无音频视频仍可用: {video_no_audio_path}")
+                    
+            except subprocess.TimeoutExpired:
+                print("✗ ffmpeg 超时 (超过5分钟)")
+                print(f"  无音频视频仍可用: {video_no_audio_path}")
+            except FileNotFoundError:
+                print("✗ 未找到 ffmpeg 命令，请确保已安装 ffmpeg")
+                print(f"  无音频视频仍可用: {video_no_audio_path}")
+            except Exception as e:
+                print(f"✗ 音频合并异常: {e}")
+                traceback.print_exc()
+                print(f"  无音频视频仍可用: {video_no_audio_path}")
+        else:
+            if audio_path is None:
+                print("\n未提供音频路径，跳过音频合并")
+            else:
+                print(f"\n音频文件不存在: {audio_path}，跳过音频合并")
+        
+        total_save_time = time.time() - save_start_time
+        print(f"\n总保存时间: {total_save_time:.2f}s")
+        print("="*80 + "\n")
+

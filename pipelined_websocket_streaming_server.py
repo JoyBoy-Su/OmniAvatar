@@ -410,7 +410,11 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
             #     num_blocks = getattr(args, 'num_blocks', 7)
             # if frames_per_block is None:
             #     frames_per_block = getattr(args, 'num_frame_per_block', 3)
-            noise = torch.randn([1, int(round(frames / 12, 0)) * 3, 16, 50, 90], device="cuda", dtype=torch.bfloat16)
+            if frames % 12 == 0:
+                num_blocks = frames // 12
+            else:
+                num_blocks = frames // 12 + 1
+            noise = torch.randn([1, num_blocks * 3, 16, 50, 90], device="cuda", dtype=torch.bfloat16)
             results = causal_model_pipeline(
                 noise=noise,
                 text_prompts=prompt,
