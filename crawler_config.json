@@ -1,0 +1,81 @@
+{
+  "youtube_queries": [
+    "music performance",
+    "piano playing",
+    "guitar solo",
+    "drum solo",
+    "nature sounds",
+    "ocean waves",
+    "rain sounds",
+    "bird singing",
+    "people talking",
+    "interview",
+    "speech",
+    "sports highlights",
+    "dance performance",
+    "cooking",
+    "painting",
+    "street performance",
+    "waterfall",
+    "thunderstorm",
+    "wildlife",
+    "city sounds",
+    "jazz music",
+    "orchestra performance",
+    "violin playing",
+    "flute playing",
+    "singing",
+    "acapella",
+    "beatbox",
+    "footsteps",
+    "car sounds",
+    "train sounds",
+    "airplane",
+    "workshop",
+    "construction",
+    "typing keyboard",
+    "clock ticking",
+    "fire crackling",
+    "water flowing",
+    "wind blowing",
+    "dog barking",
+    "cat meowing",
+    "crowd cheering",
+    "laughter",
+    "baby crying",
+    "footsteps running",
+    "door opening",
+    "glass breaking",
+    "keys jingling",
+    "phone ringing"
+  ],
+  
+  "youtube_channels": [
+    "https://www.youtube.com/@BBCEarth",
+    "https://www.youtube.com/@NatGeo",
+    "https://www.youtube.com/@NPRMusic",
+    "https://www.youtube.com/@TEDx",
+    "https://www.youtube.com/@vox",
+    "https://www.youtube.com/@vsauce"
+  ],
+  
+  "max_results_per_query": 500,
+  "max_videos_per_channel": 1000,
+  
+  "filters": {
+    "min_duration": 3,
+    "max_duration": 60,
+    "min_resolution": 480,
+    "languages": ["en", "zh", "es", "fr", "de", "ja", "ko"],
+    "exclude_categories": ["Gaming", "News & Politics"],
+    "min_views": 1000
+  },
+  
+  "download_settings": {
+    "rate_limit": "10M",
+    "max_concurrent_downloads": 50,
+    "retry_attempts": 3,
+    "timeout": 300
+  }
+}
+

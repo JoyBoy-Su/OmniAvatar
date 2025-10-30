@@ -146,7 +146,7 @@ class QwenOmniTalker:
                 os.makedirs(os.path.dirname(reply_audio_path), exist_ok=True)
                 
                 # 保存音频文件
-                sf.write(reply_audio_path, wav_array, samplerate=16000)
+                sf.write(reply_audio_path, wav_array, samplerate=24000)
                 print(f"Qwen-Omni reply audio saved to: {reply_audio_path}")
                 
                 return reply_audio_path, reply_text
@@ -621,7 +621,7 @@ def handle_generate_streaming_base64(data):
 
                         # Convert to WAV using ffmpeg
                         stream = ffmpeg.input(audio_path_original)
-                        stream = ffmpeg.output(stream, audio_path_wav, acodec='pcm_s16le', ar='16000', ac=1)
+                        stream = ffmpeg.output(stream, audio_path_wav, acodec='pcm_s16le', ar='24000', ac=1)
                         ffmpeg.run(stream, overwrite_output=True, quiet=True)
 
                         audio_path = audio_path_wav

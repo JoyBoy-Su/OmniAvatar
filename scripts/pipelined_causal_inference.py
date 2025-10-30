@@ -405,7 +405,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
             #     print(f"Audio trimmed to {max_duration} seconds")
             
             input_values = np.squeeze(
-                    self.causal_pipe.wav_feature_extractor(audio, sampling_rate=16000).input_values # TODO: update sample rate to sr
+                    self.causal_pipe.wav_feature_extractor(audio, sampling_rate=16000).input_values # TODO: update sample rate to
                 )
             input_values = torch.from_numpy(input_values).float().to(device=self.device)
             audio_len = (noise.shape[1] - 1) * 4 + 1
