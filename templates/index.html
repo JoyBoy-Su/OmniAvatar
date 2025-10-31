@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OmniAvatar 流式视频生成器</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+    <!-- VAD libraries will be loaded on-demand when VAD is activated -->
+    <!-- <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js"></script> -->
+    <!-- <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.7/dist/bundle.min.js"></script> -->
     <style>
         * {
             margin: 0;
@@ -51,9 +54,8 @@
         }
 
         .input-section {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 30px;
+            display: flex;
+            justify-content: center;
             margin-bottom: 40px;
         }
 
@@ -63,6 +65,8 @@
             padding: 25px;
             border: 2px dashed #dee2e6;
             transition: all 0.3s ease;
+            max-width: 500px;
+            width: 100%;
         }
 
         .input-card:hover {
@@ -317,6 +321,44 @@
             color: white;
         }
 
+        .vad-status {
+            position: fixed;
+            top: 20px;
+            right: 200px;
+            padding: 10px 15px;
+            border-radius: 25px;
+            font-size: 0.9em;
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .vad-status.active {
+            background: #28a745;
+            color: white;
+        }
+
+        .vad-status.inactive {
+            background: #6c757d;
+            color: white;
+        }
+
+        .vad-status.speaking {
+            background: #dc3545;
+            color: white;
+            animation: pulse 1s infinite;
+        }
+
+        .vad-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
         .audio-controls-panel {
             position: fixed;
             top: 70px;
@@ -365,16 +407,16 @@
         }
 
         @media (max-width: 768px) {
-            .input-section {
-                grid-template-columns: 1fr;
-            }
-            
             .main-content {
                 padding: 20px;
             }
-            
+
             .header h1 {
                 font-size: 2em;
+            }
+
+            .input-card {
+                max-width: 100%;
             }
         }
     </style>
@@ -383,44 +425,31 @@
     <div class="container">
         <div class="header">
             <h1>🎬 OmniAvatar 流式视频生成器</h1>
-            <p>上传图片和音频，实时生成同步的说话视频</p>
+            <p>上传图片后，点击 VAD 激活语音检测，直接说话即可自动生成视频</p>
         </div>
 
         <div class="main-content">
             <div class="input-section">
-                <!-- 音频输入区域 -->
-                <div class="input-card">
-                    <h3>🎤 音频输入</h3>
-                    <div class="audio-controls">
-                        <button id="recordBtn" class="record-btn">
-                            <span id="recordIcon">🎙️</span>
-                            <span id="recordText">开始录音</span>
-                        </button>
-                        <div class="audio-upload" onclick="document.getElementById('audioFile').click()">
-                            <p>📁 或点击上传音频文件</p>
-                            <p style="font-size: 0.9em; color: #6c757d;">支持 WAV, MP3, M4A 格式</p>
-                            <input type="file" id="audioFile" accept="audio/*" onchange="handleAudioUpload(event)">
-                        </div>
-                    </div>
-                    <div id="audioStatus" style="margin-top: 15px; font-size: 0.9em; color: #6c757d;"></div>
-                </div>
-
                 <!-- 图片输入区域 -->
                 <div class="input-card">
-                    <h3>🖼️ 图片输入</h3>
+                    <h3>🖼️ 上传图片</h3>
                     <div class="image-upload" onclick="document.getElementById('imageFile').click()">
                         <p>📁 点击上传图片</p>
                         <p style="font-size: 0.9em; color: #6c757d;">支持 JPG, PNG 格式</p>
                         <input type="file" id="imageFile" accept="image/*" onchange="handleImageUpload(event)">
                         <img id="previewImage" class="preview-image" style="display: none;">
                     </div>
+                    <div style="margin-top: 20px; padding: 15px; background: #e7f3ff; border-radius: 10px; text-align: center;">
+                        <p style="color: #0066cc; font-weight: 500;">🎙️ 上传图片后，点击右上角的 VAD 按钮激活语音检测</p>
+                        <p style="font-size: 0.9em; color: #0066cc; margin-top: 8px;">激活后直接说话即可自动生成视频！</p>
+                    </div>
                 </div>
             </div>
 
-            <!-- 生成按钮 -->
-            <button id="generateBtn" class="generate-btn" onclick="generateVideo()" disabled>
+            <!-- 生成按钮 - Hidden since VAD auto-generates video -->
+            <!-- <button id="generateBtn" class="generate-btn" onclick="generateVideo()" disabled>
                 🚀 开始流式生成
-            </button>
+            </button> -->
 
             <!-- 进度条 -->
             <div id="progressContainer" style="display: none;">
@@ -461,6 +490,12 @@
         🔴 未连接
     </div>
 
+    <!-- VAD 状态指示器 -->
+    <div id="vadStatus" class="vad-status inactive" onclick="toggleVAD()">
+        <div class="vad-indicator"></div>
+        <span id="vadText">VAD 关闭</span>
+    </div>
+
     <!-- 音频控制面板 -->
     <div id="audioControlsPanel" class="audio-controls-panel">
         <h4>🔊 音频控制</h4>
@@ -484,7 +519,10 @@
         let audioBlob = null;
         let recordingStartTime = null;
         let imageFile = null;
-        let serverUrl = window.location.origin;;
+        // Determine backend server URL based on current hostname
+        let serverUrl = window.location.hostname === 'localhost' 
+            ? 'http://localhost:20150' 
+            : `http://${window.location.hostname}:20150`;  // Backend WebSocket server URL
         let socket = null;
         let currentSessionId = null;
         let isGenerating = false;
@@ -515,6 +553,14 @@
         let audioGainNode = null;
         let isMuted = false;
         let audioVolume = 0.5;
+
+        // VAD (Voice Activity Detection) 相关变量
+        let vad = null;
+        let isVADActive = false;
+        let isVADRecording = false;
+        let vadAudioChunks = [];
+        let vadMediaRecorder = null;
+        let vadStream = null;
 
         // 固定prompt值
         const prompt = "A person speaking naturally with lip sync to the audio";
@@ -587,6 +633,11 @@
                     handleGenerationError(data);
                 });
 
+                socket.on('generation_cancelled', function(data) {
+                    console.log('WebSocket received generation_cancelled event:', data);
+                    handleGenerationCancelled(data);
+                });
+
                 socket.on('start', function(data) {
                     console.log('WebSocket received start event:', data);
                     updateStatus('视频生成已开始...', true);
@@ -621,6 +672,245 @@
             } else {
                 status.textContent = '🔴 未连接';
                 status.className = 'connection-status disconnected';
+            }
+        }
+
+        // 动态加载VAD相关库
+        async function loadVADLibraries() {
+            console.log('Loading VAD libraries...');
+            
+            // Check if already loaded
+            if (window.ort && window.vad) {
+                return true;
+            }
+            
+            try {
+                // Show loading message
+                showMessage('正在加载语音检测库，请稍候...', 'info');
+                
+                // Load ONNX Runtime
+                await loadScript('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/ort.js');
+                console.log('ONNX Runtime loaded');
+
+                // Configure ONNX Runtime to find WASM files
+                if (window.ort) {
+                    window.ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/dist/';
+                    console.log('ONNX Runtime WASM paths configured');
+                }
+
+                // Load VAD library
+                await loadScript('https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.7/dist/bundle.min.js');
+                console.log('VAD library loaded');
+
+                showMessage('语音检测库加载完成！', 'success');
+                return true;
+            } catch (error) {
+                console.error('Failed to load VAD libraries:', error);
+                showMessage('语音检测库加载失败，请刷新页面重试', 'error');
+                return false;
+            }
+        }
+        
+        // Helper function to load scripts dynamically
+        function loadScript(src) {
+            return new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = src;
+                script.onload = resolve;
+                script.onerror = reject;
+                document.head.appendChild(script);
+            });
+        }
+
+        // VAD 初始化和控制函数
+        async function initializeVAD() {
+            try {
+                console.log('Initializing VAD...');
+
+                // First load the libraries if not already loaded
+                const librariesLoaded = await loadVADLibraries();
+                if (!librariesLoaded) {
+                    throw new Error('Failed to load VAD libraries');
+                }
+
+                console.log('VAD libraries loaded, requesting microphone access...');
+
+                // 请求麦克风权限
+                vadStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        sampleRate: 16000,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
+
+                console.log('Microphone access granted, initializing VAD model...');
+
+                // 使用 vad-web 库初始化 VAD
+                vad = await window.vad.MicVAD.new({
+                    stream: vadStream,
+                    positiveSpeechThreshold: 0.8,
+                    negativeSpeechThreshold: 0.75,
+                    minSpeechFrames: 5,
+                    preSpeechPadFrames: 1,
+                    redemptionFrames: 8,
+                    onSpeechStart: () => {
+                        console.log('VAD: Speech started');
+                        updateVADStatus('speaking');
+                        startVADRecording();
+                    },
+                    onSpeechEnd: (audio) => {
+                        console.log('VAD: Speech ended');
+                        updateVADStatus('active');
+                        stopVADRecording();
+                    },
+                    onVADMisfire: () => {
+                        console.log('VAD: Misfire detected');
+                        updateVADStatus('active');
+                    }
+                });
+
+                isVADActive = true;
+                vad.start();
+                updateVADStatus('active');
+                showMessage('VAD 已激活 - 直接说话即可！', 'success');
+                console.log('VAD initialized and started');
+
+            } catch (error) {
+                console.error('Failed to initialize VAD:', error);
+                console.error('Error stack:', error.stack);
+                showMessage('VAD 初始化失败: ' + error.message, 'error');
+                isVADActive = false;
+                updateVADStatus('inactive');
+
+                // Clean up stream if it was created
+                if (vadStream) {
+                    vadStream.getTracks().forEach(track => track.stop());
+                    vadStream = null;
+                }
+            }
+        }
+
+        async function toggleVAD() {
+            if (!isVADActive) {
+                // Show loading state
+                const vadText = document.getElementById('vadText');
+                const originalText = vadText.textContent;
+                vadText.textContent = '加载中...';
+
+                try {
+                    // 启动 VAD
+                    await initializeVAD();
+                } catch (error) {
+                    console.error('Error in toggleVAD:', error);
+                } finally {
+                    // Restore text if initialization failed
+                    if (!isVADActive) {
+                        vadText.textContent = originalText;
+                    }
+                }
+            } else {
+                // 关闭 VAD
+                if (vad) {
+                    vad.pause();
+                    vad = null;
+                }
+                if (vadStream) {
+                    vadStream.getTracks().forEach(track => track.stop());
+                    vadStream = null;
+                }
+                isVADActive = false;
+                updateVADStatus('inactive');
+                showMessage('VAD 已关闭', 'info');
+                console.log('VAD stopped');
+            }
+        }
+
+        function startVADRecording() {
+            if (isVADRecording) return;
+
+            try {
+                console.log('Starting VAD recording...');
+
+                // 如果正在生成视频，取消它
+                if (isGenerating && currentSessionId) {
+                    console.log('Interrupting generation for new speech, cancelling session:', currentSessionId);
+                    // 发送取消生成的请求
+                    socket.emit('cancel_generation', { session_id: currentSessionId });
+                    showMessage('检测到新语音，正在中断当前生成...', 'info');
+                }
+
+                vadAudioChunks = [];
+                vadMediaRecorder = new MediaRecorder(vadStream, {
+                    mimeType: 'audio/webm;codecs=opus'
+                });
+
+                vadMediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        vadAudioChunks.push(event.data);
+                    }
+                };
+
+                vadMediaRecorder.onstop = () => {
+                    console.log('VAD recording stopped, processing audio...');
+                    audioBlob = new Blob(vadAudioChunks, { type: 'audio/webm' });
+
+                    // 设置为全局音频blob
+                    window.audioBlob = audioBlob;
+
+                    const sizeMB = (audioBlob.size / 1024 / 1024).toFixed(2);
+                    updateAudioStatus(`VAD录音完成！大小: ${sizeMB}MB`);
+                    showMessage('录音完成！准备生成视频...', 'success');
+
+                    // 如果已选择图片，自动生成视频
+                    if (imageFile) {
+                        console.log('Auto-generating video with VAD audio (isGenerating:', isGenerating, ')');
+                        setTimeout(() => generateVideo(), 500);
+                    } else {
+                        showMessage('请先上传图片以生成视频', 'info');
+                    }
+                };
+
+                vadMediaRecorder.start(100);
+                isVADRecording = true;
+                console.log('VAD MediaRecorder started');
+
+            } catch (error) {
+                console.error('Failed to start VAD recording:', error);
+                showMessage('VAD 录制失败: ' + error.message, 'error');
+            }
+        }
+
+        function stopVADRecording() {
+            if (!isVADRecording || !vadMediaRecorder) return;
+
+            try {
+                console.log('Stopping VAD recording...');
+                vadMediaRecorder.stop();
+                isVADRecording = false;
+            } catch (error) {
+                console.error('Failed to stop VAD recording:', error);
+            }
+        }
+
+        function updateVADStatus(status) {
+            const vadStatusEl = document.getElementById('vadStatus');
+            const vadText = document.getElementById('vadText');
+
+            vadStatusEl.className = 'vad-status ' + status;
+
+            switch(status) {
+                case 'active':
+                    vadText.textContent = 'VAD 开启';
+                    break;
+                case 'inactive':
+                    vadText.textContent = 'VAD 关闭';
+                    break;
+                case 'speaking':
+                    vadText.textContent = '正在说话...';
+                    break;
             }
         }
 
@@ -1268,8 +1558,11 @@
 
             // 重置UI
             currentSessionId = null;
-            document.getElementById('generateBtn').disabled = false;
-            document.getElementById('generateBtn').textContent = '🚀 开始流式生成';
+            const generateBtn = document.getElementById('generateBtn');
+            if (generateBtn) {
+                generateBtn.disabled = false;
+                generateBtn.textContent = '🚀 开始流式生成';
+            }
 
             // Display the first frame of the generated video instead of reference
             const videoPlayer = document.getElementById('videoPlayer');
@@ -1290,6 +1583,52 @@
             }
         }
 
+        // 处理生成取消
+        function handleGenerationCancelled(data) {
+            if (data.session_id === currentSessionId) {
+                console.log('Generation cancelled, cleaning up...');
+                isGenerating = false;
+                isPlaying = false;
+                canvasSizeSet = false;  // Reset for next generation
+
+                // 停止音频播放
+                stopAudioPlayback();
+
+                showMessage('视频生成已取消，准备录制新语音', 'info');
+                updateStatus('已取消，等待新录音...', false);
+
+                document.getElementById('progressContainer').style.display = 'none';
+                document.getElementById('streamingInfo').style.display = 'none';
+
+                // Reset session ID to allow new generation
+                currentSessionId = null;
+
+                const generateBtn = document.getElementById('generateBtn');
+                if (generateBtn) {
+                    generateBtn.disabled = false;
+                    generateBtn.textContent = '🚀 开始流式生成';
+                }
+
+                // Keep displaying the last frame if available
+                const streamingCanvas = document.getElementById('streamingCanvas');
+                const videoPlaceholder = document.getElementById('videoPlaceholder');
+
+                if (firstFrameImage && ctx) {
+                    streamingCanvas.style.display = 'block';
+                    videoPlaceholder.style.display = 'none';
+                    ctx.drawImage(firstFrameImage, 0, 0);
+                    console.log('Cancelled - displaying last rendered frame');
+                } else if (canvasSizeSet) {
+                    streamingCanvas.style.display = 'block';
+                    videoPlaceholder.style.display = 'none';
+                } else {
+                    streamingCanvas.style.display = 'none';
+                    videoPlaceholder.innerHTML = '<span style="color: #6c757d; font-size: 1.2em;">🎥 流式生成的视频将在这里实时显示</span>';
+                    videoPlaceholder.style.display = 'block';
+                }
+            }
+        }
+
         // 处理生成错误
         function handleGenerationError(data) {
             if (data.session_id === currentSessionId) {
@@ -1306,8 +1645,11 @@
                 document.getElementById('progressContainer').style.display = 'none';
                 document.getElementById('streamingInfo').style.display = 'none';
                 currentSessionId = null;
-                document.getElementById('generateBtn').disabled = false;
-                document.getElementById('generateBtn').textContent = '🚀 开始流式生成';
+                const generateBtn = document.getElementById('generateBtn');
+                if (generateBtn) {
+                    generateBtn.disabled = false;
+                    generateBtn.textContent = '🚀 开始流式生成';
+                }
 
                 // Display first frame if available, otherwise show placeholder
                 const streamingCanvas = document.getElementById('streamingCanvas');
@@ -1355,8 +1697,8 @@
             videoPlayer.play().catch(e => console.log('自动播放失败:', e));
         }
 
-        // 录音功能
-        document.getElementById('recordBtn').addEventListener('click', toggleRecording);
+        // 录音功能 - Disabled since VAD handles recording
+        // document.getElementById('recordBtn').addEventListener('click', toggleRecording);
 
         async function toggleRecording() {
             if (!isRecording) {
@@ -1372,7 +1714,7 @@
                 const stream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         channelCount: 1,  // Mono audio
-                        sampleRate: 24000,  // Higher sample rate for better quality
+                        sampleRate: 16000,  // Match model's expected sample rate
                         echoCancellation: true,
                         noiseSuppression: true,
                         autoGainControl: true
@@ -1402,6 +1744,7 @@
                 };
 
                 mediaRecorder.onstop = () => {
+                    console.log('MediaRecorder stopped, chunks collected:', audioChunks.length);
                     const mimeType = mediaRecorder.mimeType || 'audio/webm';
                     audioBlob = new Blob(audioChunks, { type: mimeType });
                     const durationSec = ((Date.now() - recordingStartTime) / 1000).toFixed(1);
@@ -1410,8 +1753,12 @@
                     console.log('Recording complete:', {
                         duration: durationSec + 's',
                         size: audioBlob.size + ' bytes',
-                        type: mimeType
+                        type: mimeType,
+                        chunksCount: audioChunks.length,
+                        audioBlob: audioBlob
                     });
+                    // Set global audioBlob for consistency with VAD
+                    window.audioBlob = audioBlob;
                     checkReadyState();
                 };
 
@@ -1429,10 +1776,20 @@
 
         function stopRecording() {
             if (mediaRecorder && isRecording) {
-                mediaRecorder.stop();
-                mediaRecorder.stream.getTracks().forEach(track => track.stop());
-                isRecording = false;
-                updateRecordButton(false);
+                try {
+                    console.log('Stopping recording, mediaRecorder state:', mediaRecorder.state);
+                    if (mediaRecorder.state !== 'inactive') {
+                        mediaRecorder.stop();
+                    }
+                    mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                    isRecording = false;
+                    updateRecordButton(false);
+                } catch (error) {
+                    console.error('Error stopping recording:', error);
+                    updateAudioStatus('停止录音时出错: ' + error.message);
+                }
+            } else {
+                console.warn('stopRecording called but mediaRecorder is not active');
             }
         }
 
@@ -1454,16 +1811,6 @@
 
         function updateAudioStatus(message) {
             document.getElementById('audioStatus').textContent = message;
-        }
-
-        // 音频文件上传
-        function handleAudioUpload(event) {
-            const file = event.target.files[0];
-            if (file) {
-                audioBlob = file;
-                updateAudioStatus('音频文件已上传: ' + file.name);
-                checkReadyState();
-            }
         }
 
         // 图片文件上传
@@ -1488,15 +1835,40 @@
         // 检查是否准备好生成
         function checkReadyState() {
             const generateBtn = document.getElementById('generateBtn');
-            generateBtn.disabled = !(audioBlob && imageFile);
+            const hasAudio = audioBlob || window.audioBlob;
+            const hasImage = imageFile;
+            
+            console.log('checkReadyState:', {
+                hasAudio: hasAudio,
+                hasImage: hasImage,
+                audioBlob: audioBlob,
+                windowAudioBlob: window.audioBlob,
+                imageFile: imageFile
+            });
+            
+            if (generateBtn) {
+                generateBtn.disabled = !(hasAudio && hasImage);
+            }
         }
 
         // 生成视频
         async function generateVideo() {
-            if (!audioBlob || !imageFile) {
+            // Use either local audioBlob or global window.audioBlob
+            const currentAudioBlob = audioBlob || window.audioBlob;
+            
+            if (!currentAudioBlob || !imageFile) {
                 showMessage('请先选择音频和图片文件', 'error');
+                console.error('Missing required files:', {
+                    audioBlob: audioBlob,
+                    windowAudioBlob: window.audioBlob,
+                    currentAudioBlob: currentAudioBlob,
+                    imageFile: imageFile
+                });
                 return;
             }
+            
+            // Update audioBlob to use the current one
+            audioBlob = currentAudioBlob;
 
             if (isGenerating) {
                 return;
@@ -1533,8 +1905,11 @@
 
             // 显示进度条
             document.getElementById('progressContainer').style.display = 'block';
-            document.getElementById('generateBtn').disabled = true;
-            document.getElementById('generateBtn').textContent = '🔄 生成中...';
+            const generateBtn = document.getElementById('generateBtn');
+            if (generateBtn) {
+                generateBtn.disabled = true;
+                generateBtn.textContent = '🔄 生成中...';
+            }
             updateStatus('正在初始化生成...', true);
 
             try {
@@ -1599,8 +1974,11 @@
                 showMessage('生成视频失败: ' + error.message, 'error');
                 updateStatus('生成失败', false);
                 isGenerating = false;
-                document.getElementById('generateBtn').disabled = false;
-                document.getElementById('generateBtn').textContent = '🚀 开始流式生成';
+                const generateBtn = document.getElementById('generateBtn');
+                if (generateBtn) {
+                    generateBtn.disabled = false;
+                    generateBtn.textContent = '🚀 开始流式生成';
+                }
                 document.getElementById('progressContainer').style.display = 'none';
             }
         }

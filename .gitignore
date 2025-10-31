@@ -2,3 +2,9 @@ __pycache__/
 *.mp4
 demo_out/
 .sii/
+*.pyc
+.claude/
+qwen_omni.py
+VAD_IMPLEMENTATION_SUMMARY.md
+VAD_INTEGRATION_GUIDE.md
+QUICK_START_VAD.md

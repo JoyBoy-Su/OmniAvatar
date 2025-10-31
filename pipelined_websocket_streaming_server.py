@@ -45,6 +45,11 @@ socketio = SocketIO(
     ping_interval=25
 )
 
+# Custom exception for generation cancellation
+class GenerationCancelledException(Exception):
+    """Raised when generation is cancelled by user"""
+    pass
+
 # Global variables
 model_pipeline = None
 causal_model_pipeline = None
@@ -219,6 +224,13 @@ def streaming_callback(data):
             print("Warning: No session_id in streaming callback data")
             return
 
+        # Check if generation has been cancelled
+        if session_id in active_sessions:
+            stop_flag = active_sessions[session_id].get('stop_flag')
+            if stop_flag and stop_flag.is_set():
+                print(f"[CALLBACK] Generation cancelled for session {session_id}, stopping callback")
+                return  # Stop processing callbacks
+
         event_type = data.get('type')
         
         # 如果是视频帧数据，尝试添加对应的音频片段
@@ -349,11 +361,14 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
     # print(f"Causal Args: num_blocks: {num_blocks}, frames_per_block: {frames_per_block}")
     try:
         # Update session status
+        stop_flag = threading.Event()
         active_sessions[session_id] = {
             'status': 'generating',
             'thread': threading.current_thread(),
             'start_time': datetime.now(),
-            'audio_path': audio_path  # 保存音频路径用于后续音频片段提取
+            'audio_path': audio_path,  # 保存音频路径用于后续音频片段提取
+            'stop_flag': stop_flag,  # Flag to signal cancellation
+            'frames_generated': 0  # Track progress for cancellation reporting
         }
 
         # Process audio conversation with Qwen-Omni if enabled and audio is provided
@@ -415,17 +430,28 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
             else:
                 num_blocks = frames // 12 + 1
             noise = torch.randn([1, num_blocks * 3, 16, 50, 90], device="cuda", dtype=torch.bfloat16)
-            results = causal_model_pipeline(
-                noise=noise,
-                text_prompts=prompt,
-                image_path=image_path,
-                audio_path=final_audio_path,  # Use processed audio from Qwen-Omni
-                initial_latent=None,
-                return_latents=False,
-                streaming_callback=streaming_callback,
-                session_id=session_id
-            )
-            
+
+            # Check for cancellation before starting generation
+            if stop_flag.is_set():
+                print(f"[CANCEL] Generation cancelled before starting for session {session_id}")
+                return
+
+            try:
+                results = causal_model_pipeline(
+                    noise=noise,
+                    text_prompts=prompt,
+                    image_path=image_path,
+                    audio_path=final_audio_path,  # Use processed audio from Qwen-Omni
+                    initial_latent=None,
+                    return_latents=False,
+                    streaming_callback=streaming_callback,
+                    session_id=session_id,
+                    stop_flag=stop_flag  # Pass stop flag for cancellation support
+                )
+            except GenerationCancelledException:
+                print(f"[CANCEL] Generation was cancelled for session {session_id}")
+                return
+
             # Process causal results
             video = None
             if results:
@@ -542,6 +568,47 @@ def handle_leave_session(data):
         print(f"Client {client_sid} left session {session_id}")
         emit('session_left', {'session_id': session_id})
 
+@socketio.on('cancel_generation')
+def handle_cancel_generation(data):
+    """Handle cancellation of ongoing generation"""
+    session_id = data.get('session_id')
+    client_sid = request.sid
+
+    if not session_id:
+        emit('error', {'message': 'No session_id provided'})
+        return
+
+    if session_id not in active_sessions:
+        emit('error', {'message': f'Session {session_id} not found'})
+        return
+
+    session_info = active_sessions[session_id]
+
+    if session_info.get('status') != 'generating':
+        print(f"[CANCEL] Session {session_id} is not generating (status: {session_info.get('status')})")
+        emit('error', {'message': 'Generation is not active'}, room=session_id)
+        return
+
+    print(f"[CANCEL] Client {client_sid} requested to cancel generation for session {session_id}")
+
+    # Set the stop flag
+    if 'stop_flag' in session_info:
+        session_info['stop_flag'].set()
+        print(f"[CANCEL] Stop flag set for session {session_id}")
+
+        # Update session status
+        session_info['status'] = 'cancelling'
+
+        # Emit cancellation acknowledgment
+        socketio.emit('generation_cancelled', {
+            'session_id': session_id,
+            'message': 'Generation cancelled by user',
+            'frames_generated': session_info.get('frames_generated', 0)
+        }, room=session_id)
+    else:
+        print(f"[CANCEL] No stop_flag found for session {session_id}")
+        emit('error', {'message': 'Cannot cancel: stop_flag not initialized'}, room=session_id)
+
 @socketio.on('generate_streaming_base64')
 def handle_generate_streaming_base64(data):
     """Handle pipelined streaming video generation request with base64 data"""
@@ -621,7 +688,7 @@ def handle_generate_streaming_base64(data):
 
                         # Convert to WAV using ffmpeg
                         stream = ffmpeg.input(audio_path_original)
-                        stream = ffmpeg.output(stream, audio_path_wav, acodec='pcm_s16le', ar='24000', ac=1)
+                        stream = ffmpeg.output(stream, audio_path_wav, acodec='pcm_s16le', ar='16000', ac=1)
                         ffmpeg.run(stream, overwrite_output=True, quiet=True)
 
                         audio_path = audio_path_wav
@@ -778,9 +845,9 @@ def main():
     
 
     initialize_model(causal_mode=True)
-    port = 20143  # Changed from 20144 to avoid conflict
+    port = 20150  # Backend WebSocket server port
     print(f"Starting Flask-SocketIO server on port {port}...")
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    socketio.run(app, host='0.0.0.0', port=port, debug=True)
 
 if __name__ == '__main__':
     # import pdb; pdb.set_trace()

@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Connection Test</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+</head>
+<body>
+    <h1>WebSocket Connection Test</h1>
+    <div id="status">Checking connection...</div>
+    <button onclick="testConnection()">Test Connection</button>
+    <pre id="log"></pre>
+
+    <script>
+        const log = document.getElementById('log');
+        const status = document.getElementById('status');
+        
+        function addLog(msg) {
+            log.textContent += new Date().toISOString() + ' - ' + msg + '\n';
+            console.log(msg);
+        }
+
+        function testConnection() {
+            addLog('Starting connection test...');
+            
+            const serverUrl = window.location.hostname === 'localhost' 
+                ? 'http://localhost:20150' 
+                : `http://${window.location.hostname}:20150`;
+            
+            addLog('Server URL: ' + serverUrl);
+            
+            const socket = io(serverUrl, {
+                transports: ['polling'],
+                upgrade: false
+            });
+            
+            socket.on('connect', function() {
+                addLog('Connected! Socket ID: ' + socket.id);
+                status.textContent = 'Connected successfully!';
+                status.style.color = 'green';
+            });
+            
+            socket.on('disconnect', function() {
+                addLog('Disconnected');
+                status.textContent = 'Disconnected';
+                status.style.color = 'red';
+            });
+            
+            socket.on('connect_error', function(error) {
+                addLog('Connection error: ' + error.message);
+                status.textContent = 'Connection failed: ' + error.message;
+                status.style.color = 'red';
+            });
+            
+            // Test health endpoint
+            socket.emit('health_check', {}, function(response) {
+                addLog('Health check response: ' + JSON.stringify(response));
+            });
+        }
+        
+        // Auto-test on load
+        window.onload = function() {
+            testConnection();
+        };
+    </script>
+</body>
+</html>

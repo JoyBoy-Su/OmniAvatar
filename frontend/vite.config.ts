@@ -15,12 +15,12 @@ export default defineConfig({
     host: '0.0.0.0',
     proxy: {
       '/socket.io': {
-        target: 'http://localhost:20143',
+        target: 'http://localhost:20150',
         changeOrigin: true,
         ws: true,
       },
       '/api': {
-        target: 'http://localhost:20143',
+        target: 'http://localhost:20150',
         changeOrigin: true,
       },
     },

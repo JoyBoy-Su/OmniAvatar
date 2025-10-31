@@ -132,7 +132,8 @@ class PipelinedCausalInferencePipeline(nn.Module):
             output: torch.Tensor,
             audio_path: str,
             streaming_callback,
-            session_id
+            session_id,
+            stop_flag=None
         ):
         """
         Run pipelined causal inference
@@ -189,6 +190,15 @@ class PipelinedCausalInferencePipeline(nn.Module):
         total_frames_generated = 0
         send_future = None
         for current_num_frames in all_num_frames:
+            # Check for cancellation
+            if stop_flag and stop_flag.is_set():
+                print(f"[CANCEL] Stop flag detected at block {self.current_clock}, stopping generation")
+                # Import here to avoid circular dependency
+                import sys
+                sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+                from pipelined_websocket_streaming_server import GenerationCancelledException
+                raise GenerationCancelledException(f"Generation cancelled at block {self.current_clock}")
+
             print(f"===================== Current clock: {self.current_clock} ======================")
             print(f"Processing frame {current_start_frame - num_input_frames} to {current_start_frame + current_num_frames - num_input_frames}.")
             noisy_input = noise[:, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
@@ -348,7 +358,8 @@ class PipelinedCausalInferencePipeline(nn.Module):
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
         streaming_callback=None,  # 流式生成回调函数
-        session_id=None
+        session_id=None,
+        stop_flag=None  # Flag to signal cancellation
     ) -> torch.Tensor:
         """
         Forward pass with automatic conditioning initialization.
@@ -471,7 +482,8 @@ class PipelinedCausalInferencePipeline(nn.Module):
             output=output,
             audio_path=audio_path,
             streaming_callback=streaming_callback,
-            session_id=session_id
+            session_id=session_id,
+            stop_flag=stop_flag
         )
     
     @torch.no_grad()

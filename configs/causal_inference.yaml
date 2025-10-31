@@ -1,10 +1,10 @@
 # Causal Inference Configuration
 dtype: "bf16"
-text_encoder_path: /mnt/workspace/jdsu/ckpts/Wan-AI/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
+text_encoder_path: /data2/ckpts/Wan2.1t2v-1.3B/models_t5_umt5-xxl-enc-bf16.pth
 image_encoder_path: None
-dit_path: /mnt/workspace/models/livevideo/model.safetensors
-vae_path: /mnt/workspace/jdsu/ckpts/Wan-AI/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
-wav2vec_path: /mnt/workspace/jdsu/ckpts/facebook/wav2vec2-base-960h
+dit_path: /data2/ckpts/ai2v/version0.1/checkpoint_model_000500/model.safetensors
+vae_path: /data2/ckpts/Wan2.1t2v-1.3B/Wan2.1_VAE.pth
+wav2vec_path: /data2/ckpts/facebook/wav2vec2-base-960h
 sp_size: 1
 
 # Data parameters

@@ -1,7 +1,17 @@
 {
   "permissions": {
     "allow": [
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:wiki.vad.ricky0123.com)",
+      "WebSearch",
+      "Bash(npm install:*)",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:vad.ricky0123.com)",
+      "WebFetch(domain:docs.vad.ricky0123.com)",
+      "Bash(ss -tlnp:*)",
+      "Bash(lsof:*)",
+      "Bash(git checkout:*)"
     ],
     "deny": [],
     "ask": []

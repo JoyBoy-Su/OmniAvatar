@@ -583,7 +583,7 @@ class WanInferencePipeline(nn.Module):
                     audio_tensor = torch.cat([audio_prefix, audio_tensor], dim=0)
                     audio_prefix = audio_tensor[-fixed_frame:]
                     audio_tensor = audio_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)
-                    audio_emb["audio_emb"] = audio_emb
+                    audio_emb["audio_emb"] = audio_tensor
                 else:
                     audio_prefix = None
                 if image is not None and img_lat is None:
