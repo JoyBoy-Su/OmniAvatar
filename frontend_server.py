@@ -26,5 +26,5 @@ if __name__ == '__main__':
     # 确保templates目录存在
     os.makedirs('templates', exist_ok=True)
     
-    print("Starting Frontend Server on port 8080...")
-    app.run(host='0.0.0.0', port=8080, debug=True) 
+    print("Starting Frontend Server on port 9090...")
+    app.run(host='0.0.0.0', port=9090, debug=True) 

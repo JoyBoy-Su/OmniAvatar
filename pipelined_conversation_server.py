@@ -22,9 +22,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), ".")))
 
 from OmniAvatar.utils.args_config import parse_args
 # pdb.set_trace()
-from scripts.pipelined_inference import PipelinedWanInferencePipeline, set_seed
+from scripts.pipelined_inference import set_seed
 # pdb.set_trace()
 from scripts.pipelined_causal_inference import PipelinedCausalInferencePipeline
+from scripts.pipelined_conversation import PipelinedConversation
 # pdb.set_trace()
 from OmniAvatar.utils.io_utils import save_video_as_grid_and_mp4
 
@@ -45,122 +46,13 @@ socketio = SocketIO(
 )
 
 # Global variables
-model_pipeline = None
-causal_model_pipeline = None
+conversation_pipeline = None
 args = None
 active_sessions = {}  # session_id -> thread info
-use_causal_mode = True  # Flag to switch between normal and causal mode
-qwen_omni_talker = None  # Qwen-Omni talker instance
 
-class QwenOmniTalker:
-    """Qwen-Omni语音对话处理器"""
-    
-    def __init__(self, api_key="sk-63ad221681734d339b8171797204f105", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"):
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
-        self.system_message = {
-            "role": "system",
-            "content": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.",
-        }
-        
-    def process_audio_conversation(self, audio_path, session_id=None, prompt="Analyze this audio and respond naturally."):
-        """
-        处理音频对话，返回回复的音频文件路径
-
-        Args:
-            audio_path: 输入音频文件路径
-            session_id: 会话ID，用于生成唯一的输出文件名
-            prompt: 文本提示词，默认为分析音频内容
-
-        Returns:
-            tuple: (reply_audio_path, reply_text) 回复音频路径和文本内容
-        """
-        try:
-            # 读取音频文件并编码为base64
-            with open(audio_path, 'rb') as audio_file:
-                audio_bytes = audio_file.read()
-                audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
-
-            # 构建消息 - 使用input_audio格式发送音频输入
-            messages = [
-                self.system_message,
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "input_audio", "input_audio": {"data": f"data:;base64,{audio_base64}", "format": "wav"}},
-                    ],
-                },
-            ]
-            
-            # 调用Qwen-Omni API
-            completion = self.client.chat.completions.create(
-                model="qwen3-omni-flash",
-                messages=messages,
-                modalities=["text", "audio"],
-                audio={
-                    "voice": "Cherry",  # Cherry, Ethan, Serena, Chelsie is available
-                    "format": "wav"
-                },
-                stream=True,
-                stream_options={"include_usage": True}
-            )
-            
-            # 收集响应
-            text_parts = []
-            audio_string = ""
-            
-            for chunk in completion:
-                if chunk.choices:
-                    if hasattr(chunk.choices[0].delta, "audio") and chunk.choices[0].delta.audio:
-                        try:
-                            if "data" in chunk.choices[0].delta.audio:
-                                audio_string += chunk.choices[0].delta.audio["data"]
-                            elif "transcript" in chunk.choices[0].delta.audio:
-                                text_parts.append(chunk.choices[0].delta.audio["transcript"])
-                        except Exception as e:
-                            print(f"Error processing audio chunk: {e}")
-                    elif hasattr(chunk.choices[0].delta, "content") and chunk.choices[0].delta.content:
-                        text_parts.append(chunk.choices[0].delta.content)
-                else:
-                    if hasattr(chunk, 'usage') and chunk.usage:
-                        print(f"Usage: {chunk.usage}")
-            
-            reply_text = "".join(text_parts)
-            print(f"Qwen-Omni reply text: {reply_text}")
-            
-            # 保存音频文件
-            if audio_string:
-                wav_bytes = base64.b64decode(audio_string)
-                wav_array = np.frombuffer(wav_bytes, dtype=np.int16)
-                
-                # 生成唯一的输出文件名
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                session_suffix = f"_{session_id}" if session_id else ""
-                reply_audio_path = f"demo_out/qwen_omni_reply_{timestamp}{session_suffix}.wav"
-                
-                # 确保输出目录存在
-                os.makedirs(os.path.dirname(reply_audio_path), exist_ok=True)
-                
-                # 保存音频文件
-                sf.write(reply_audio_path, wav_array, samplerate=24000)
-                print(f"Qwen-Omni reply audio saved to: {reply_audio_path}")
-                
-                return reply_audio_path, reply_text
-            else:
-                print("Warning: No audio data received from Qwen-Omni")
-                return None, reply_text
-                
-        except Exception as e:
-            print(f"Error in Qwen-Omni conversation: {e}")
-            traceback.print_exc()
-            return None, None
-
-def initialize_model(causal_mode=True):
+def initialize_model():
     """Initialize the pipelined model pipeline"""
-    global model_pipeline, causal_model_pipeline, args, use_causal_mode, qwen_omni_talker
+    global conversation_pipeline, args
     
     # Set sys.argv to only include model-related args
     sys.argv = ['pipelined_websocket_streaming_server.py', '--config', 'configs/causal_inference.yaml']
@@ -190,8 +82,6 @@ def initialize_model(causal_mode=True):
     if not hasattr(args, 'independent_first_frame'):
         args.independent_first_frame = False
 
-    use_causal_mode = causal_mode
-
     # Set CUDA device for causal mode (needs multiple GPUs)
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2'
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -201,13 +91,8 @@ def initialize_model(causal_mode=True):
 
     set_seed(args.seed)
     print("Initializing pipelined causal model pipeline...")
-    causal_model_pipeline = PipelinedCausalInferencePipeline(args)
-    print("Pipelined causal model pipeline initialized successfully!")
-    
-    # Initialize Qwen-Omni talker
-    print("Initializing Qwen-Omni talker...")
-    qwen_omni_talker = QwenOmniTalker()
-    print("Qwen-Omni talker initialized successfully!")
+    conversation_pipeline = PipelinedConversation(args)
+    print("Pipelined conversation pipeline initialized successfully!")
 
 def streaming_callback(data):
     """Callback function for streaming data from pipelined inference pipeline"""
@@ -220,79 +105,12 @@ def streaming_callback(data):
 
         event_type = data.get('type')
         
-        # 如果是视频帧数据，尝试添加对应的音频片段
-        if event_type == 'video_frame' and 'frame_number' in data:
-            # 添加音频片段信息到数据中
-            add_audio_segment_to_frame(data, session_id)
-        elif event_type == 'video_chunk' and 'chunk_number' in data:
-            # 为视频块添加音频片段
-            add_audio_segment_to_chunk(data, session_id)
-        
         # Send data to frontend via WebSocket
         socketio.emit(event_type, data, room=session_id)
 
     except Exception as e:
         print(f"[PIPELINED_BACKEND] Error in streaming callback: {e}")
         traceback.print_exc()
-
-def add_audio_segment_to_frame(data, session_id):
-    # import pdb; pdb.set_trace()
-    """为视频帧添加对应的音频片段"""
-    try:
-        # 获取当前会话的音频信息
-        if session_id in active_sessions:
-            session_info = active_sessions[session_id]
-            audio_path = session_info.get('reply_audio_path')
-            
-            if audio_path and os.path.exists(audio_path):
-                frame_number = data.get('frame_number', 0)
-                total_frames = data.get('total_frames', 1)
-                
-                # 计算音频片段的时间范围（假设25fps）
-                fps = 16
-                frame_duration = 1.0 / fps
-                start_time = (frame_number - 1) * frame_duration
-                end_time = frame_number * frame_duration
-                
-                # 提取音频片段
-                audio_segment = extract_audio_segment(audio_path, start_time, end_time)
-                if audio_segment:
-                    data['audio_segment'] = audio_segment
-                    data['audio_start_time'] = start_time
-                    data['audio_duration'] = frame_duration
-                    
-    except Exception as e:
-        print(f"Error adding audio segment to frame: {e}")
-
-def add_audio_segment_to_chunk(data, session_id):
-    # import pdb; pdb.set_trace()
-    """为视频块添加对应的音频片段"""
-    try:
-        # 获取当前会话的音频信息
-        if session_id in active_sessions:
-            session_info = active_sessions[session_id]
-            audio_path = session_info.get('reply_audio_path')
-            
-            if audio_path and os.path.exists(audio_path):
-                chunk_number = data.get('chunk_number', 0)
-                frames_in_chunk = data.get('frames_in_chunk', 3)
-                
-                # 计算音频片段的时间范围（假设25fps）
-                fps = 16
-                frame_duration = 1.0 / fps
-                chunk_duration = frames_in_chunk * frame_duration
-                start_time = chunk_number * chunk_duration
-                end_time = start_time + chunk_duration
-                
-                # 提取音频片段
-                audio_segment = extract_audio_segment(audio_path, start_time, end_time)
-                if audio_segment:
-                    data['audio_segment'] = audio_segment
-                    data['audio_start_time'] = start_time
-                    data['audio_duration'] = chunk_duration
-                    
-    except Exception as e:
-        print(f"Error adding audio segment to chunk: {e}")
 
 def extract_audio_segment(audio_path, start_time, end_time):
     """提取音频片段并转换为base64"""
@@ -341,9 +159,9 @@ def extract_audio_segment(audio_path, start_time, end_time):
         print(f"Error extracting audio segment: {e}")
         return None
 
-def generate_video_streaming(session_id, prompt, audio_path=None, image_path=None, use_conversation=True):
+def generate_video_streaming(session_id, prompt, audio_path=None, image_path=None):
     """Generate video in pipelined streaming mode"""
-    global model_pipeline, causal_model_pipeline, args, use_causal_mode, qwen_omni_talker
+    global conversation_pipeline, args
     # print(f"Input Args: num_steps: {num_steps}, guidance_scale: {guidance_scale}, audio_scale: {audio_scale}")
     # print(f"Causal Args: num_blocks: {num_blocks}, frames_per_block: {frames_per_block}")
     try:
@@ -357,64 +175,19 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
 
         # Process audio conversation with Qwen-Omni if enabled and audio is provided
         final_audio_path = audio_path
-        conversation_text = None
         # import pdb; pdb.set_trace()
-        if use_conversation and audio_path and qwen_omni_talker:
-            try:
-                # Send conversation processing status
-                socketio.emit('conversation_processing', {
-                    'type': 'conversation_processing',
-                    'session_id': session_id,
-                    'message': 'Processing audio conversation with Qwen-Omni...'
-                }, room=session_id)
-                
-                print(f"Processing conversation for session {session_id} with input audio: {audio_path}")
-                reply_audio_path, reply_text = qwen_omni_talker.process_audio_conversation(audio_path, session_id)
-                
-                if reply_audio_path:
-                    final_audio_path = reply_audio_path
-                    conversation_text = reply_text
-                    print(f"Using Qwen-Omni reply audio: {final_audio_path}")
-                    active_sessions[session_id]["reply_audio_path"] = reply_audio_path
-                    # Send conversation completion status
-                    socketio.emit('conversation_complete', {
-                        'type': 'conversation_complete',
-                        'session_id': session_id,
-                        'message': 'Audio conversation completed, starting video generation...',
-                        'reply_text': reply_text
-                    }, room=session_id)
-                else:
-                    print("Failed to get reply audio from Qwen-Omni, using original audio")
-                    socketio.emit('conversation_warning', {
-                        'type': 'conversation_warning',
-                        'session_id': session_id,
-                        'message': 'Conversation processing failed, using original audio for video generation'
-                    }, room=session_id)
-                    
-            except Exception as e:
-                print(f"Error in conversation processing: {e}")
-                traceback.print_exc()
-                socketio.emit('conversation_error', {
-                    'type': 'conversation_error',
-                    'session_id': session_id,
-                    'message': f'Conversation processing failed: {str(e)}, using original audio'
-                }, room=session_id)
         audio_data, sample_rate = sf.read(final_audio_path)
         duration: float = audio_data.size / sample_rate
         frames = int(duration * 16)
         print(f"audio_data: {audio_data.size}, duration: {duration}, frames: {frames}")
         with torch.no_grad():
             # Use causal pipeline
-            # if num_blocks is None:
-            #     num_blocks = getattr(args, 'num_blocks', 7)
-            # if frames_per_block is None:
-            #     frames_per_block = getattr(args, 'num_frame_per_block', 3)
             if frames % 12 == 0:
                 num_blocks = frames // 12
             else:
                 num_blocks = frames // 12 + 1
             noise = torch.randn([1, num_blocks * 3, 16, 50, 90], device="cuda", dtype=torch.bfloat16)
-            results = causal_model_pipeline(
+            results = conversation_pipeline(
                 noise=noise,
                 text_prompts=prompt,
                 image_path=image_path,
@@ -438,7 +211,7 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
         # Save final video
         if video is not None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            mode_prefix = "causal_" if use_causal_mode else ""
+            mode_prefix = ""
             output_dir = f'demo_out/{mode_prefix}pipelined_streaming_output_{timestamp}'
             os.makedirs(output_dir, exist_ok=True)
 
@@ -450,17 +223,6 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
                 audio_path=final_audio_path if args.use_audio else None,
                 prefix=f'{mode_prefix}pipelined_streaming_result_{session_id}'
             )
-            
-            # Save conversation info if available
-            if conversation_text:
-                conversation_info_path = os.path.join(output_dir, f'conversation_info_{session_id}.txt')
-                with open(conversation_info_path, 'w', encoding='utf-8') as f:
-                    f.write(f"Session ID: {session_id}\n")
-                    f.write(f"Timestamp: {timestamp}\n")
-                    f.write(f"Original Audio: {audio_path}\n")
-                    f.write(f"Reply Audio: {final_audio_path}\n")
-                    f.write(f"Conversation Reply: {conversation_text}\n")
-                    f.write(f"Video Prompt: {prompt}\n")
 
         # Send completion event
         completion_data = {
@@ -469,22 +231,6 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
             'message': "Causal Pipelined video generation completed"
         }
         
-        # Add conversation info if available
-        if conversation_text:
-            completion_data.update({
-                'conversation_reply': conversation_text,
-                'used_conversation': True,
-                'original_audio': audio_path,
-                'reply_audio': final_audio_path
-            })
-        else:
-            completion_data['used_conversation'] = False
-        # if use_causal_mode:
-        #     completion_data.update({
-        #         'total_blocks': num_blocks,
-        #         # 'frames_per_block': frames_per_block,
-        #         'total_frames': num_blocks * frames_per_block
-        #     })
         socketio.emit('generation_complete', completion_data, room=session_id)
 
         print(f"Pipelined causal streaming generation completed for session {session_id}")
@@ -494,7 +240,7 @@ def generate_video_streaming(session_id, prompt, audio_path=None, image_path=Non
             'type': 'generation_error',
             'session_id': session_id,
             'error': str(e),
-            'message': f'{"Causal " if use_causal_mode else ""}Pipelined video generation failed'
+            'message': 'Pipelined video generation failed'
         }
         socketio.emit('generation_error', error_data, room=session_id)
         print("Error in pipelined causal streaming generation for session {session_id}: {e}")
@@ -544,12 +290,12 @@ def handle_leave_session(data):
 @socketio.on('generate_streaming_base64')
 def handle_generate_streaming_base64(data):
     """Handle pipelined streaming video generation request with base64 data"""
-    global model_pipeline, causal_model_pipeline, use_causal_mode
+    global conversation_pipeline
 
     print(f"[DEBUG] Received generate_streaming_base64 request")
-    current_pipeline = causal_model_pipeline if use_causal_mode else model_pipeline
+    current_pipeline = conversation_pipeline
     if current_pipeline is None:
-        mode_str = "causal " if use_causal_mode else ""
+        mode_str = ""
         emit('error', {'message': f'Pipelined {mode_str}model not initialized'})
         return
 
@@ -578,8 +324,6 @@ def handle_generate_streaming_base64(data):
         
         print(f"num steps: {num_steps}, args.num steps: {args.num_steps}")
         print(f"use_conversation: {use_conversation}")
-        if use_causal_mode:
-            print(f"Causal params: num_blocks: {num_blocks}, frames_per_block: {frames_per_block}")
 
         # Create temporary files
         audio_path = None
@@ -645,7 +389,7 @@ def handle_generate_streaming_base64(data):
                 temp_files.append(image_path)
 
             # Generate session ID
-            mode_prefix = "causal_" if use_causal_mode else ""
+            mode_prefix = ""
             session_id = f"{mode_prefix}pipelined_session_{int(torch.rand(1).item() * 1000000)}"
 
             # Join the session room
@@ -654,20 +398,14 @@ def handle_generate_streaming_base64(data):
             # Send success response
             response_data = {
                 'session_id': session_id,
-                'message': f'{"Causal " if use_causal_mode else ""}Pipelined streaming generation started'
+                'message': 'Pipelined streaming generation started'
             }
-            if use_causal_mode:
-                response_data.update({
-                    'num_blocks': num_blocks,
-                    'frames_per_block': frames_per_block,
-                    'total_frames': num_blocks * frames_per_block
-                })
             emit('generation_started', response_data)
 
             # Start generation in background thread
             generation_thread = threading.Thread(
                 target=generate_video_streaming,
-                args=(session_id, prompt, audio_path, image_path, use_conversation)
+                args=(session_id, prompt, audio_path, image_path)
             )
             generation_thread.daemon = True
             generation_thread.start()
@@ -688,50 +426,16 @@ def handle_generate_streaming_base64(data):
 @socketio.on('generate_causal_streaming_base64')
 def handle_generate_causal_streaming_base64(data):
     """Handle causal pipelined streaming video generation request with base64 data"""
-    global use_causal_mode
     
-    # Temporarily switch to causal mode for this request
-    original_mode = use_causal_mode
-    use_causal_mode = True
-    
-    try:
-        handle_generate_streaming_base64(data)
-    finally:
-        # Restore original mode
-        use_causal_mode = original_mode
-
-@socketio.on('switch_mode')
-def handle_switch_mode(data):
-    """Handle switching between normal and causal mode"""
-    global use_causal_mode, model_pipeline, causal_model_pipeline
-    
-    requested_mode = data.get('mode', 'normal')  # 'normal' or 'causal'
-    
-    if requested_mode == 'causal':
-        if causal_model_pipeline is None:
-            emit('error', {'message': 'Causal model not initialized. Please restart server with causal mode.'})
-            return
-        use_causal_mode = True
-        emit('mode_switched', {'mode': 'causal', 'message': 'Switched to causal inference mode'})
-    else:
-        if model_pipeline is None:
-            emit('error', {'message': 'Normal model not initialized. Please restart server with normal mode.'})
-            return
-        use_causal_mode = False
-        emit('mode_switched', {'mode': 'normal', 'message': 'Switched to normal inference mode'})
-    
-    print(f"Mode switched to: {'causal' if use_causal_mode else 'normal'}")
+    handle_generate_streaming_base64(data)
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    global model_pipeline, causal_model_pipeline, use_causal_mode, qwen_omni_talker
+    global conversation_pipeline
     return {
         "status": "healthy",
-        "model_loaded": model_pipeline is not None,
-        "causal_model_loaded": causal_model_pipeline is not None,
-        "qwen_omni_loaded": qwen_omni_talker is not None,
-        "current_mode": "causal" if use_causal_mode else "normal",
+        "conversation_loaded": conversation_pipeline is not None,
         "streaming_supported": True,
         "websocket_enabled": True,
         "pipelined_mode": True,
@@ -742,30 +446,13 @@ def health_check():
 @app.route('/api/model_info', methods=['GET'])
 def model_info():
     """Get model information"""
-    global args, use_causal_mode, qwen_omni_talker
+    global args
     info = {
-        "current_mode": "causal" if use_causal_mode else "normal",
         "supported_features": ["i2v", "audio", "streaming", "pipelined", "conversation"]
     }
-    
-    if qwen_omni_talker:
-        info["conversation_model"] = "qwen-omni-turbo"
-        info["conversation_voices"] = ["Cherry", "Ethan", "Serena", "Chelsie"]
-    
-    if use_causal_mode:
-        info.update({
-            "model_type": "causal_pipelined",
-            "num_blocks": getattr(args, 'num_blocks', 7),
-            "frames_per_block": getattr(args, 'num_frame_per_block', 3),
-            "num_transformer_blocks": getattr(args, 'num_transformer_blocks', 30),
-            "frame_seq_length": getattr(args, 'frame_seq_length', 1560),
-            "independent_first_frame": getattr(args, 'independent_first_frame', False)
-        })
-        info["supported_features"].append("causal_inference")
-    else:
-        info.update({
-            "model_type": "normal_pipelined"
-        })
+    info.update({
+        "model_type": "normal_pipelined"
+    })
     
     return info
 
@@ -776,7 +463,7 @@ def main():
     print("Starting OmniAvatar Pipelined WebSocket Streaming Server...")
     
 
-    initialize_model(causal_mode=True)
+    initialize_model()
     port = 20143  # Changed from 20144 to avoid conflict
     print(f"Starting Flask-SocketIO server on port {port}...")
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
