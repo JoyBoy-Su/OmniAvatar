@@ -79,10 +79,12 @@ class PipelinedCausalInferencePipeline(nn.Module):
         self.denoising_queue = queue.Queue()  # denoising任务队列
         self.vae_queue = queue.Queue()  # decoding任务队列
         self.result_buffer = {}  # 保持字典结构，用于按chunk_id排序
+        self.latents_buffer = {}
         # 多线程控制
         self.denoising_thread = None
         self.vae_thread = None
         self.result_lock = threading.Lock()
+        self.latents_lock = threading.Lock()
         self.stop_workers = threading.Event()  # Signal to stop worker threads
         # 事件触发同步机制
         self.denoising_events = deque()
@@ -177,10 +179,11 @@ class PipelinedCausalInferencePipeline(nn.Module):
         self.vae_thread.start()
         
         # Step 2: cache context feature
-        current_start_frame = 0
+        current_start_frame_global = 0
+        current_start_frame_local = 0
         if initial_latent is not None:
             print("INITIAL_LATENT is not None!!")
-            raise ValueError
+            # raise ValueError
         
         # Step 3: temporal denoising loop
         print(f"NUM BLOCKS is {num_blocks}")
@@ -190,16 +193,16 @@ class PipelinedCausalInferencePipeline(nn.Module):
         send_future = None
         for current_num_frames in all_num_frames:
             print(f"===================== Current clock: {self.current_clock} ======================")
-            print(f"Processing frame {current_start_frame - num_input_frames} to {current_start_frame + current_num_frames - num_input_frames}.")
-            noisy_input = noise[:, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
-            y_input = conditional_dict["image"][:, :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
-            audio_input = conditional_dict["audio"][:,current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+            print(f"Processing frame {current_start_frame_global - num_input_frames} to {current_start_frame_global + current_num_frames - num_input_frames}.")
+            noisy_input = noise[:, current_start_frame_global - num_input_frames:current_start_frame_global + current_num_frames - num_input_frames]
+            y_input = conditional_dict["image"][:, :, current_start_frame_local - num_input_frames:current_start_frame_local + current_num_frames - num_input_frames]
+            audio_input = conditional_dict["audio"][:,current_start_frame_global - num_input_frames:current_start_frame_global + current_num_frames - num_input_frames]
             block_conditional_dict = conditional_dict.copy()
             block_conditional_dict.update(image=y_input.clone(), audio=audio_input.clone())
             
             denoising_task = {
                 "chunk_id": self.current_clock,
-                "current_start_frame": current_start_frame,
+                "current_start_frame": current_start_frame_local,
                 "current_num_frames": current_num_frames,
                 "img_lat": img_lat.clone(),
                 "batch_size": batch_size,
@@ -213,48 +216,90 @@ class PipelinedCausalInferencePipeline(nn.Module):
             self.denoising_events[self.current_clock].wait()
             if self.current_clock >= 1:
                 self.vae_events[self.current_clock - 1].wait()
-            
+            # Step 3.4: update the start and end frame indices
+            current_start_frame_local += current_num_frames
+            current_start_frame_global += current_num_frames
             # Step 3.5: Update img_lat every 3 blocks with latest generated latents
             # After denoising is complete, we can safely access output
             # Update after completing blocks 2, 5, 8, ... (i.e., when self.current_clock is 2, 5, 8, ...)
             # This ensures blocks 3, 6, 9, ... will use the updated img_lat
+            # if reset, wait vae_events[self.current_clock]
             if (self.current_clock + 1) % 3 == 0 and self.current_clock >= 2:
                 print(f"Updating img_lat after block {self.current_clock} with latest generated latents")
                 # Extract the latest generated latents from output
-                # output shape: (batch, num_frames, channels=16, h, w)
-                # Get the last frame from current block (which has just been denoised)
-                latest_frame_idx = current_start_frame + current_num_frames - 1
-                latest_latents = output[:, latest_frame_idx:latest_frame_idx + 1]  # (batch, 1, 16, h, w)
+                self.vae_events[self.current_clock].wait()
+                # get last frame
+                with self.result_lock:
+                    last_block_frames = self.result_buffer[self.current_clock]["video"]
+                    print(f"last_block_frames shape: {last_block_frames.shape}")
+                last_frame = last_block_frames[:, -1:]  # (batch 1, frame 1, chanel 3, h 400, w 720)
+                # save last frame as image
+                for frame_idx in range(last_block_frames.shape[1]):
+                    frame = last_block_frames[:, frame_idx]
+                    frame_np = (frame.squeeze(0).squeeze(0).permute(1, 2, 0).cpu().float().numpy() * 255).astype('uint8')
+                    frame_pil = Image.fromarray(frame_np)
+                    frame_pil.save(f"examples/chunk_id_{self.current_clock}_frame_{frame_idx}.png")
+                import pdb; pdb.set_trace()
+                # target shape (batch 1, channel 3, frame 1, h 400, w 720)
+                last_frame = last_frame.permute(0, 2, 1, 3, 4)
+                print(f"last_frame shape: {last_frame.shape}")
                 
-                # Convert to img_lat format: (batch, channels, num_frames, h, w)
-                latest_latents = latest_latents.permute(0, 2, 1, 3, 4)  # (batch, 16, 1, h, w)
+                # encode last frame to img_lat (following the logic in forward function)
+                encode_start_time = time.time()
+                
+                # Ensure last_frame is in the correct range [-1, 1] for VAE encoding
+                # last_frame should already be in [0, 1] or [-1, 1] from VAE decode
+                # If it's in [0, 1], convert to [-1, 1]
+                if last_frame.min() >= 0:
+                    print(f"last_frame.min() >= 0, convert to [-1, 1]")
+                    last_frame = last_frame * 2.0 - 1.0
+                
+                # VAE encode to get latent representation
+                self.causal_pipe.vae.to("cuda:1")
+                new_img_lat = self.causal_pipe.vae.encode(
+                    videos=last_frame.to(dtype=self.dtype),
+                    device="cuda:1"
+                )  # Shape: (batch, 16, 1, h, w)
+                print(f"Encoded new_img_lat shape: {new_img_lat.shape}")
                 
                 # Repeat to match num_frames dimension (same as original img_lat)
-                batch_size, num_channels, _, height, width = latest_latents.shape
                 num_frames_for_img_lat = img_lat.shape[2]  # Use original img_lat's num_frames
-                latest_latents = latest_latents.repeat(1, 1, num_frames_for_img_lat, 1, 1)  # (batch, 16, num_frames, h, w)
+                new_img_lat = new_img_lat.repeat(1, 1, num_frames_for_img_lat, 1, 1)  # (batch, 16, num_frames, h, w)
+                print(f"Repeated new_img_lat shape: {new_img_lat.shape}")
                 
-                # Create mask: first frame mask=0, rest mask=1
-                msk = torch.zeros_like(latest_latents)[:, :1]  # (batch, 1, num_frames, h, w)
+                # Create mask: first frame mask=0 (fixed), rest mask=1 (can be generated)
+                msk = torch.zeros_like(new_img_lat)[:, :1]  # (batch, 1, num_frames, h, w)
                 msk[:, :, 1:] = 1
                 
-                # Concatenate latents and mask
-                img_lat = torch.cat([latest_latents, msk], dim=1)  # (batch, 17, num_frames, h, w)
+                # Concatenate latents and mask to get final img_lat format
+                img_lat = torch.cat([new_img_lat, msk], dim=1)  # (batch, 17, num_frames, h, w)
+                print(f"Updated img_lat shape: {img_lat.shape}")
                 
-                # Update conditional_dict with new img_lat
-                # Need to update the full image conditional dict for all future frames
-                # The img_lat should be repeated to match total num_frames
+                # Update conditional_dict with new img_lat for all future frames
                 total_num_frames = noise.shape[1]
-                if img_lat.shape[2] < total_num_frames:
-                    # Repeat img_lat to match total num_frames
-                    repeat_factor = total_num_frames // img_lat.shape[2] + 1
-                    img_lat_repeated = img_lat.repeat(1, 1, repeat_factor, 1, 1)
-                    img_lat_repeated = img_lat_repeated[:, :, :total_num_frames]
-                else:
-                    img_lat_repeated = img_lat[:, :, :total_num_frames]
+                # if img_lat.shape[2] < total_num_frames:
+                #     # Repeat img_lat to match total num_frames
+                #     print(f"img_lat.shape[2] < total_num_frames, img_lat.shape[2]: {img_lat.shape[2]}, total_num_frames: {total_num_frames}")
+                    # repeat_factor = total_num_frames // img_lat.shape[2] + 1
+                    # img_lat_repeated = img_lat.repeat(1, 1, repeat_factor, 1, 1)
+                    # img_lat_repeated = img_lat_repeated[:, :, :total_num_frames]
+                # else:
+                #     print(f"img_lat.shape[2] >= total_num_frames, img_lat.shape[2]: {img_lat.shape[2]}, total_num_frames: {total_num_frames}")  
+                #     img_lat_repeated = img_lat[:, :, :total_num_frames]
                 
-                conditional_dict["image"] = img_lat_repeated
-                print(f"Updated img_lat shape: {img_lat.shape}, conditional_dict['image'] shape: {conditional_dict['image'].shape}")
+                # img_lat = img_lat_repeated.clone()
+                conditional_dict["image"] = img_lat.clone()
+                print(f"img_lat shape: {img_lat.shape}")
+                print(f"updated conditional_dict['image'] shape: {conditional_dict['image'].shape}")
+                import pdb; pdb.set_trace()
+                encode_time = time.time() - encode_start_time
+                self._record_timing("img_lat_update_encode", encode_time, self.current_clock)
+                # import pdb; pdb.set_trace()
+                # reset
+                self.causal_pipe.vae.clear_cache()
+                self.causal_pipe.reset_caches(noise.device)
+                current_start_frame_local = 0
+                
             
             # send current chunk, TODO: update interface
             if send_future is not None:
@@ -269,10 +314,6 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 total_frames_generated,
                 num_blocks
             )
-            # total_frames_generated = self._send_chunk_frames(self.current_clock - 1, streaming_callback, session_id, total_frames_generated, num_blocks)
-            # import pdb; pdb.set_trace()
-            # Step 3.4: update the start and end frame indices
-            current_start_frame += current_num_frames
             self.current_clock += 1
         # TODO: wait decoding the last chunk?
         self.vae_events[self.current_clock - 1].wait()
@@ -419,8 +460,21 @@ class PipelinedCausalInferencePipeline(nn.Module):
             _, _, h, w = image.shape
             select_size = match_size(getattr(self.args, f'image_sizes_{self.args.max_hw}'), h, w)
             image = resize_pad(image, (h, w), select_size)
-            image = image * 2.0 - 1.0
+            print(f"image shape after resize: {image.shape}")
+            
+            # save original image (before normalization)
+            # image shape should be (1, 3, h, w) in range [0, 1]
+            image_to_save = image.squeeze(0).permute(1, 2, 0)  # (h, w, 3)
+            image_np = (image_to_save.cpu().float().numpy() * 255).astype('uint8')
+            image_pil = Image.fromarray(image_np)
+            image_pil.save("examples/original_image.png")
+            print(f"Saved original image with shape: {image_np.shape}")
+            
+            # Now normalize for model input
+            image = image * 2.0 - 1.0  # Convert to [-1, 1]
             image = image[:, :, None]
+            print(f"encode image shape: {image.shape}")
+            # import pdb; pdb.set_trace()
             image_prep_time = time.time() - start_time
             self._record_timing("forward_image_preprocessing", image_prep_time)
             
@@ -540,6 +594,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 output = task["output"]
                 # import pdb; pdb.set_trace()
                 # Step 3.1: Spatial denoising loop
+                # import pdb; pdb.set_trace()
                 denoising_loop_start = time.time()
                 for index, current_timestep in enumerate(self.causal_pipe.denoising_step_list):
                     step_start_time = time.time()
@@ -605,30 +660,21 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 total_denoising_time = time.time() - denoising_start_time
                 self._record_timing("denoising_total", total_denoising_time, chunk_id)
 
-                # Trigger denoising event - use chunk_id instead of self.current_clock to avoid race condition
-                self.denoising_events[chunk_id].set()
-                
-                # Create VAE event for this block
-                self.vae_events.append(threading.Event())
-                
-                # Add VAE decoding task (video is already decoded by causal_pipe.inference)
-                # But we still need to process it for streaming
-                # if current_start_frame > 0:
-                #     task.update({
-                #         "latents": output[:, current_start_frame - 1:current_start_frame + current_num_frames].clone()
-                #     })
-                # else:
-                # if current_start_frame > 0:
-                #     latents = output[:, current_start_frame-1:current_start_frame + current_num_frames]
-                # else:
                 latents = output[:, current_start_frame:current_start_frame + current_num_frames]
                 print(f"chunk_id: {chunk_id}, latents: {latents.shape}")
                 task.update({
                     "latents": latents.clone()
                 })
                 self.vae_queue.put(task)
-                
+                with self.latents_lock:
+                    self.latents_buffer[chunk_id] = latents.clone()
                 print(f"Causal denoising inference completed for block {chunk_id}")
+                # Trigger denoising event - use chunk_id instead of self.current_clock to avoid race condition
+                self.denoising_events[chunk_id].set()
+                
+                # Create VAE event for this block
+                self.vae_events.append(threading.Event())
+                
                 self.denoising_queue.task_done()
 
             except queue.Empty:
@@ -668,6 +714,7 @@ class PipelinedCausalInferencePipeline(nn.Module):
                 # VAE解码阶段
                 decode_start_time = time.time()
                 video = self.causal_pipe.vae.decode(latents, device="cuda:1", tiled=False, tile_size=(30, 52), tile_stride=(15, 26)).permute(0, 2, 1, 3, 4)
+                print(f"video shape: {video.shape}")
                 decode_time = time.time() - decode_start_time
                 self._record_timing("vae_decode", decode_time, chunk_id)
                 
