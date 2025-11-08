@@ -53,7 +53,7 @@ use_causal_mode = True  # Flag to switch between normal and causal mode
 qwen_omni_talker = None  # Qwen-Omni talker instance
 
 class QwenOmniTalker:
-    """Qwen-Omni语音对话处理器"""
+    """Qwen-Omni语音对话处理器 - 支持多轮对话"""
     
     def __init__(self, api_key="sk-63ad221681734d339b8171797204f105", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"):
         self.client = OpenAI(
@@ -64,36 +64,48 @@ class QwenOmniTalker:
             "role": "system",
             "content": "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech.",
         }
-        
+        # 存储每个会话的对话历史 {session_id: [messages]}
+        self.conversation_history = {}
+        # 默认最大历史轮数（可根据需要调整）
+        self.max_history_turns = 10
+    
     def process_audio_conversation(self, audio_path, session_id=None, prompt="Analyze this audio and respond naturally."):
         """
-        处理音频对话，返回回复的音频文件路径
+        处理音频对话，返回回复的音频文件路径（支持多轮对话）
 
         Args:
             audio_path: 输入音频文件路径
-            session_id: 会话ID，用于生成唯一的输出文件名
+            session_id: 会话ID，用于生成唯一的输出文件名和管理对话历史
             prompt: 文本提示词，默认为分析音频内容
 
         Returns:
             tuple: (reply_audio_path, reply_text) 回复音频路径和文本内容
         """
         try:
+            # 使用默认session_id如果未提供
+            if session_id is None:
+                session_id = "default"
+            
+            # 初始化该会话的历史记录（如果不存在）
+            if session_id not in self.conversation_history:
+                self.conversation_history[session_id] = []
+            
             # 读取音频文件并编码为base64
             with open(audio_path, 'rb') as audio_file:
                 audio_bytes = audio_file.read()
                 audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
 
-            # 构建消息 - 使用input_audio格式发送音频输入
-            messages = [
-                self.system_message,
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "input_audio", "input_audio": {"data": f"data:;base64,{audio_base64}", "format": "wav"}},
-                    ],
-                },
-            ]
+            # 构建当前用户消息
+            current_user_message = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "input_audio", "input_audio": {"data": f"data:;base64,{audio_base64}", "format": "wav"}},
+                ],
+            }
+            
+            # 构建完整的消息列表：系统消息 + 历史消息 + 当前消息
+            messages = [self.system_message] + self.conversation_history[session_id] + [current_user_message]
             
             # 调用Qwen-Omni API
             completion = self.client.chat.completions.create(
@@ -131,6 +143,34 @@ class QwenOmniTalker:
             reply_text = "".join(text_parts)
             print(f"Qwen-Omni reply text: {reply_text}")
             
+            # 保存对话历史：将用户消息和助手回复添加到历史记录
+            # 用户消息（包含文本和音频数据）
+            user_history_message = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "input_audio", "input_audio": {"data": f"data:;base64,{audio_base64}", "format": "wav"}},
+                ]
+            }
+            
+            # 助手回复消息
+            assistant_history_message = {
+                "role": "assistant",
+                "content": reply_text
+            }
+            
+            # 添加到历史记录
+            self.conversation_history[session_id].append(user_history_message)
+            self.conversation_history[session_id].append(assistant_history_message)
+            
+            # 限制历史记录长度（保留最近的 max_history_turns 轮对话）
+            # 每轮对话包含2条消息（用户+助手），所以总共保留 max_history_turns * 2 条消息
+            max_messages = self.max_history_turns * 2
+            if len(self.conversation_history[session_id]) > max_messages:
+                self.conversation_history[session_id] = self.conversation_history[session_id][-max_messages:]
+            
+            print(f"Session {session_id} history: {len(self.conversation_history[session_id])} messages")
+            
             # 保存音频文件
             if audio_string:
                 wav_bytes = base64.b64decode(audio_string)
@@ -157,6 +197,62 @@ class QwenOmniTalker:
             print(f"Error in Qwen-Omni conversation: {e}")
             traceback.print_exc()
             return None, None
+    
+    def clear_session_history(self, session_id=None):
+        """
+        清除指定会话的对话历史
+        
+        Args:
+            session_id: 会话ID，如果为None则清除所有会话历史
+        """
+        if session_id is None:
+            self.conversation_history.clear()
+            print("All conversation history cleared")
+        elif session_id in self.conversation_history:
+            del self.conversation_history[session_id]
+            print(f"Session {session_id} history cleared")
+        else:
+            print(f"Session {session_id} not found")
+    
+    def get_session_history(self, session_id):
+        """
+        获取指定会话的对话历史
+        
+        Args:
+            session_id: 会话ID
+            
+        Returns:
+            list: 对话历史消息列表
+        """
+        return self.conversation_history.get(session_id, [])
+    
+    def set_max_history_turns(self, max_turns):
+        """
+        设置最大历史轮数
+        
+        Args:
+            max_turns: 最大保留的对话轮数
+        """
+        self.max_history_turns = max_turns
+        print(f"Max history turns set to {max_turns}")
+    
+    def get_session_count(self):
+        """
+        获取当前活跃会话数量
+        
+        Returns:
+            int: 活跃会话数量
+        """
+        return len(self.conversation_history)
+    
+    def list_sessions(self):
+        """
+        列出所有活跃会话ID
+        
+        Returns:
+            list: 会话ID列表
+        """
+        return list(self.conversation_history.keys())
 
 def initialize_model(causal_mode=True):
     """Initialize the pipelined model pipeline"""
